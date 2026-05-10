@@ -15,7 +15,6 @@ import {
   __testInternals,
   cleanupAllSessionState,
   cleanupSessionState,
-  evictStaleConversations,
   deriveBridgeKey,
   deriveBridgeKeyFromSessionId,
   deriveConversationKey,
@@ -706,9 +705,7 @@ describe("session cleanup", () => {
       conversationId: "conv",
       checkpoint: null,
 
-      sessionScoped: true,
       blobStore: new Map(),
-      lastAccessMs: Date.now(),
     });
     return {
       bridgeKey,
@@ -776,9 +773,7 @@ describe("session cleanup hook wiring", () => {
       conversationId: "conv",
       checkpoint: null,
 
-      sessionScoped: true,
       blobStore: new Map(),
-      lastAccessMs: Date.now(),
     });
 
     const ctx = { sessionManager: { getSessionId: () => sessionId } };
@@ -809,62 +804,12 @@ describe("session cleanup hook wiring", () => {
         conversationId: "conv",
         checkpoint: null,
 
-        sessionScoped: true,
         blobStore: new Map(),
-        lastAccessMs: Date.now(),
       });
       await handlers.get(event)?.({}, ctx);
       expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
       expect(__testInternals.conversationStates.has(convKey)).toBe(false);
     }
-  });
-});
-
-describe("session-scoped eviction policy", () => {
-  test("evictStaleConversations keeps session-scoped state past TTL", () => {
-    const convKey = deriveConversationKeyFromSessionId("session-ttl");
-    __testInternals.conversationStates.set(convKey, {
-      conversationId: "conv-session",
-      checkpoint: null,
-
-      sessionScoped: true,
-      blobStore: new Map(),
-      lastAccessMs: 0,
-    });
-
-    evictStaleConversations(31 * 60 * 1000);
-    expect(__testInternals.conversationStates.has(convKey)).toBe(true);
-  });
-
-  test("evictStaleConversations removes anonymous state past TTL", () => {
-    const convKey = "anon-key";
-    __testInternals.conversationStates.set(convKey, {
-      conversationId: "conv-anon",
-      checkpoint: null,
-
-      sessionScoped: false,
-      blobStore: new Map(),
-      lastAccessMs: 0,
-    });
-
-    evictStaleConversations(31 * 60 * 1000);
-    expect(__testInternals.conversationStates.has(convKey)).toBe(false);
-  });
-
-  test("cleanupSessionState still removes session-scoped state explicitly", () => {
-    const sessionId = "session-explicit";
-    const convKey = deriveConversationKeyFromSessionId(sessionId);
-    __testInternals.conversationStates.set(convKey, {
-      conversationId: "conv-explicit",
-      checkpoint: null,
-
-      sessionScoped: true,
-      blobStore: new Map(),
-      lastAccessMs: 0,
-    });
-
-    cleanupSessionState(sessionId);
-    expect(__testInternals.conversationStates.has(convKey)).toBe(false);
   });
 });
 
@@ -1629,9 +1574,7 @@ describe("proxy integration — session handling", () => {
       conversationId: "conv-partial-tools",
       checkpoint: null,
 
-      sessionScoped: true,
       blobStore: new Map(),
-      lastAccessMs: Date.now(),
     });
 
     const bridge = new FakeBridge(
@@ -1791,9 +1734,7 @@ describe("proxy integration — session handling", () => {
       conversationId: "conv-tool-pause-close",
       checkpoint: null,
 
-      sessionScoped: true,
       blobStore: new Map(),
-      lastAccessMs: Date.now(),
     });
 
     const bridge = new FakeBridge(
@@ -1857,9 +1798,7 @@ describe("proxy integration — session handling", () => {
       conversationId: "conv-cancel",
       checkpoint: null,
 
-      sessionScoped: true,
       blobStore: new Map(),
-      lastAccessMs: Date.now(),
     });
 
     const bridge = new FakeBridge(
@@ -1928,9 +1867,7 @@ describe("proxy integration — session handling", () => {
       conversationId: "conv-interrupt-after-checkpoint",
       checkpoint: null,
 
-      sessionScoped: true,
       blobStore: new Map(),
-      lastAccessMs: Date.now(),
     });
 
     const interruptedBridge = new FakeBridge(
@@ -2023,9 +1960,7 @@ describe("proxy integration — session handling", () => {
       conversationId: "conv-partial-assistant",
       checkpoint: null,
 
-      sessionScoped: true,
       blobStore: new Map(),
-      lastAccessMs: Date.now(),
     });
 
     const interruptedBridge = new FakeBridge(
@@ -2132,9 +2067,7 @@ describe("proxy integration — session handling", () => {
     __testInternals.conversationStates.set(convKey, {
       conversationId: "conv-old",
       checkpoint: priorCheckpoint,
-      sessionScoped: true,
       blobStore: new Map(priorPayload.blobStore),
-      lastAccessMs: Date.now(),
     });
 
     const interruptedBridge = new FakeBridge(
@@ -2256,9 +2189,7 @@ describe("proxy integration — session handling", () => {
         priorRequest.conversationState,
       ),
 
-      sessionScoped: true,
       blobStore: new Map(),
-      lastAccessMs: Date.now(),
     });
 
     const storedCheckpoint =

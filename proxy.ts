@@ -174,9 +174,7 @@ interface ActiveBridge {
 export interface StoredConversation {
   conversationId: string;
   checkpoint: Uint8Array | null;
-  sessionScoped: boolean;
   blobStore: Map<string, Uint8Array>;
-  lastAccessMs: number;
 }
 
 interface StreamState {
@@ -251,7 +249,6 @@ interface ParsedMessages {
 
 const activeBridges = new Map<string, ActiveBridge>();
 const conversationStates = new Map<string, StoredConversation>();
-const CONVERSATION_TTL_MS = 30 * 60 * 1000;
 let bridgeFactory: BridgeFactory = spawnBridge;
 let debugRequestCounter = 0;
 let debugLogFilePath: string | undefined;
@@ -700,18 +697,6 @@ function readBody(req: IncomingMessage): Promise<string> {
 
 // ── Request handling ──
 
-export function evictStaleConversations(now = Date.now()): void {
-  for (const [key, stored] of conversationStates) {
-    if (
-      !stored.sessionScoped &&
-      now - stored.lastAccessMs > CONVERSATION_TTL_MS
-    ) {
-      debugLog("conversation.evict", { key, stored, now });
-      conversationStates.delete(key);
-    }
-  }
-}
-
 /**
  * Insert reasoning effort into model ID, before -fast/-thinking suffix.
  * e.g. model="gpt-5.4" + effort="medium" → "gpt-5.4-medium"
@@ -826,15 +811,10 @@ async function handleChatCompletion(
     stored = {
       conversationId: deterministicConversationId(convKey),
       checkpoint: null,
-
-      sessionScoped: !!sessionId,
       blobStore: new Map(),
-      lastAccessMs: Date.now(),
     };
     conversationStates.set(convKey, stored);
   }
-  stored.lastAccessMs = Date.now();
-  evictStaleConversations();
 
   const mcpTools = buildMcpToolDefinitions(tools);
   const effectiveUserText =
@@ -2280,7 +2260,6 @@ function writeSSEStream(
               stored.checkpoint = checkpointBytes;
               for (const [k, v] of blobStore) stored.blobStore.set(k, v);
 
-              stored.lastAccessMs = Date.now();
             }
             debugLog("stream.checkpoint_buffered", {
               requestId,
@@ -2331,7 +2310,6 @@ function writeSSEStream(
     const stored = conversationStates.get(convKey);
     if (stored) {
       for (const [k, v] of blobStore) stored.blobStore.set(k, v);
-      stored.lastAccessMs = Date.now();
       if (!cancelled && latestCheckpoint) {
         stored.checkpoint = latestCheckpoint;
         debugLog("stream.checkpoint_committed", { requestId, convKey, stored });
@@ -2625,7 +2603,6 @@ async function handleNonStreamingResponse(
                   for (const [k, v] of payload.blobStore)
                     stored.blobStore.set(k, v);
 
-                  stored.lastAccessMs = Date.now();
                 }
                 debugLog("nonstream.checkpoint_buffered", {
                   requestId,
@@ -2670,7 +2647,6 @@ async function handleNonStreamingResponse(
       const stored = conversationStates.get(convKey);
       if (stored) {
         for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
-        stored.lastAccessMs = Date.now();
         if (!cancelled && !nonStreamError && latestCheckpoint) {
           stored.checkpoint = latestCheckpoint;
           debugLog("nonstream.checkpoint_committed", {
