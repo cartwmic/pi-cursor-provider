@@ -1,6 +1,6 @@
 # pi-cursor-provider
 
-> **This fork improves on the upstream in three areas:** image support, correct `pi -p` exit behaviour, and removal of dead eviction code. See the sections below for details.
+> **This fork improves on the upstream in six areas:** image support, correct `pi -p` exit behaviour, removal of dead eviction code, accurate per-model context window inference, post-compaction session sync, and context window scaling when Cursor enforces a tighter cap. See the sections below for details.
 
 [![npm version](https://img.shields.io/npm/v/@offbynan/pi-cursor-provider.svg)](https://www.npmjs.com/package/@offbynan/pi-cursor-provider)
 
@@ -32,6 +32,43 @@ This fork fixes both: empty and non-JSON end-stream bodies are treated as succes
 ### Removed dead eviction code
 
 The upstream proxy included a 30-minute TTL eviction mechanism (`evictStaleConversations`, `CONVERSATION_TTL_MS`, `sessionScoped`, `lastAccessMs`). All conversations created by pi include a session ID, permanently exempting them from TTL eviction, so this code was never reachable. This fork removes it.
+
+### Accurate per-model context window inference
+
+Cursor's `GetUsableModels` RPC does not return context window sizes, so the upstream proxy hardcodes 200 k for every model. This fork exports an `inferContextWindow(id)` function that derives the correct window from known model families:
+
+| Family | Window |
+| ------ | ------ |
+| Claude 4.6 Sonnet / Opus | 1 M |
+| All other Claude | 200 k |
+| Gemini 2.5 / 3.x | 1 M |
+| GPT nano / mini variants | 128 k |
+| GPT-5.5+ | 1 M |
+| GPT-5.x (other) | 400 k |
+| Grok 4 | 256 k |
+| Kimi K2.x | 262 k |
+| Anything with `-1m` suffix | 1 M |
+| Unknown / Composer | 200 k |
+
+This ensures pi uses the right compaction thresholds and token budget for each model.
+
+### Post-compaction session sync
+
+When pi compacts its message list (the `session_compact` lifecycle event), the proxy's cached conversation checkpoint still reflects the full pre-compaction conversation. Continuing without clearing that cache would cause a history mismatch, forcing an expensive full reconstruction on the next request.
+
+This fork listens for `session_compact` and eagerly clears the stored checkpoint for the affected session, so both sides stay in sync at zero extra cost.
+
+### Context window scaling when Cursor enforces a tighter cap
+
+Cursor sometimes enforces a tighter context window at runtime than what the model ID implies (for example, capping Gemini at 200 k even though we registered 1 M). In that case the raw `usedTokens` from Cursor's `ConversationTokenDetails` would appear far below pi's compaction threshold, so pi would never compact — then Cursor would eventually error with a context-overflow.
+
+This fork reads `maxTokens` from `ConversationTokenDetails` and, when Cursor's cap is tighter than the inferred window, scales `total_tokens` proportionally:
+
+```
+total_tokens = round(usedTokens × piWindow / cursorWindow)
+```
+
+That makes pi's compaction threshold fire at the right time relative to the window Cursor is actually enforcing.
 
 ## How it works
 

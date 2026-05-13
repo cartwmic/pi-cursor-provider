@@ -30,6 +30,7 @@ import {
 import {
   cleanupSessionState,
   getCursorModels,
+  inferContextWindow,
   startProxy,
   type CursorModel,
 } from "./proxy.js";
@@ -474,7 +475,7 @@ function modelConfig(m: ProcessedModel) {
     reasoning: supportsReasoningModelId(m.id),
     input: ["text", "image"] as ("text" | "image")[],
     cost: estimateModelCost(m.id),
-    contextWindow: m.contextWindow,
+    contextWindow: inferContextWindow(m.id),
     maxTokens: m.maxTokens,
     compat: {
       supportsDeveloperRole: false,
@@ -515,6 +516,16 @@ export function registerSessionLifecycleCleanup(pi: ExtensionAPI): void {
   pi.on("session_before_fork", cleanupCurrentSession);
   pi.on("session_before_tree", cleanupCurrentSession);
   pi.on("session_shutdown", cleanupCurrentSession);
+
+  // After pi compacts its message list the cursor proxy's cached checkpoint
+  // still reflects the full pre-compaction conversation.  Clearing the state
+  // here forces the proxy to rebuild the cursor conversation from pi's now-
+  // compacted messages on the next request, so both sides stay in sync.
+  pi.on("session_compact", (_event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    debugExtensionLog("session.post_compact_cleanup", { sessionId });
+    cleanupSessionState(sessionId);
+  });
 }
 
 function registerExtensionDebugHooks(pi: ExtensionAPI) {

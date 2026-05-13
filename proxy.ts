@@ -178,13 +178,24 @@ export interface StoredConversation {
   conversationId: string;
   checkpoint: Uint8Array | null;
   blobStore: Map<string, Uint8Array>;
+  /**
+   * Cursor's actual context window for this conversation, populated from
+   * ConversationTokenDetails.maxTokens in checkpoint updates.  Used to correct
+   * our static inferContextWindow() estimate when Cursor enforces a tighter cap.
+   */
+  effectiveContextWindow?: number;
 }
 
 interface StreamState {
   toolCallIndex: number;
   pendingExecs: PendingExec[];
   outputTokens: number;
+  /** usedTokens from Cursor's ConversationTokenDetails. */
   totalTokens: number;
+  /** maxTokens from Cursor's ConversationTokenDetails; 0 = not yet received. */
+  cursorContextWindow: number;
+  /** inferContextWindow(modelId) — our static estimate for this model. */
+  inferredContextWindow: number;
 }
 
 interface ToolResultInfo {
@@ -580,6 +591,54 @@ function decodeConnectUnaryBody(payload: Uint8Array): Uint8Array | null {
   return null;
 }
 
+/**
+ * Infer context window size from the model ID.
+ *
+ * Cursor's GetUsableModels RPC does not expose context window sizes, so we
+ * derive them from known model families.  Update when new major versions ship.
+ *
+ * Sources:
+ *  - Claude: platform.claude.ai/docs — claude-4.6-sonnet / claude-4.6-opus: 1M (GA Mar 2026);
+ *    all other Claude incl. 4.5, 4, Haiku: 200k.
+ *  - Gemini: ai.google.dev/gemini-api/docs — all 2.5 / 3.x models: 1M.
+ *  - GPT: chatai.guide — GPT-5.x: 400k; GPT-5.5+: 1M; nano/mini variants: 128k.
+ *  - Grok 4: docs.x.ai — 256k.
+ *  - Kimi K2.x: platform.kimi.ai — 262,144 tokens (256k).
+ */
+export function inferContextWindow(id: string): number {
+  const lower = id.toLowerCase();
+
+  // Any model with an explicit -1m suffix (e.g. claude-4-sonnet-1m)
+  if (lower.includes("-1m")) return 1_048_576;
+
+  // ── Claude ────────────────────────────────────────────────────────────────
+  // Sonnet 4.6 and Opus 4.6 gained 1M context (GA March 2026).
+  // All earlier versions (4.5, 4, …) and Haiku remain at 200k.
+  if (lower.startsWith("claude-4.6-sonnet") || lower.startsWith("claude-4.6-opus")) return 1_048_576;
+  if (lower.startsWith("claude-")) return 200_000;
+
+  // ── Gemini ────────────────────────────────────────────────────────────────
+  // Gemini 2.5 / 3.x family: 1M context.
+  if (lower.startsWith("gemini-")) return 1_048_576;
+
+  // ── GPT ───────────────────────────────────────────────────────────────────
+  // nano / mini variants: 128k.  GPT-5.5+: 1M.  Everything else (5.x): 400k.
+  if (/^gpt-[0-9.]*-(nano|mini)/.test(lower)) return 128_000;
+  if (lower.startsWith("gpt-5.5")) return 1_048_576;
+  if (lower.startsWith("gpt-")) return 400_000;
+
+  // ── Grok ──────────────────────────────────────────────────────────────────
+  // Grok 4 series: 256k.
+  if (lower.startsWith("grok-")) return 256_000;
+
+  // ── Kimi ──────────────────────────────────────────────────────────────────
+  // Kimi K2.x: 262,144 tokens (256k).
+  if (lower.startsWith("kimi-")) return 262_144;
+
+  // Composer, default, unknown: 200k.
+  return 200_000;
+}
+
 function normalizeCursorModels(models: readonly unknown[]): CursorModel[] {
   const byId = new Map<string, CursorModel>();
   for (const model of models) {
@@ -593,7 +652,7 @@ function normalizeCursorModels(models: readonly unknown[]): CursorModel[] {
       id,
       name,
       reasoning: Boolean(m["thinkingDetails"]),
-      contextWindow: 200_000,
+      contextWindow: inferContextWindow(id),
       maxTokens: 64_000,
     });
   }
@@ -1428,7 +1487,9 @@ function processServerMessage(
   } else if (msgCase === "conversationCheckpointUpdate") {
     const stateStructure = msg.message.value as ConversationStateStructure;
     if ((stateStructure as any).tokenDetails) {
-      state.totalTokens = (stateStructure as any).tokenDetails.usedTokens;
+      const td = (stateStructure as any).tokenDetails as { usedTokens?: number; maxTokens?: number };
+      if (td.usedTokens) state.totalTokens = td.usedTokens;
+      if (td.maxTokens) state.cursorContextWindow = td.maxTokens;
     }
     if (onCheckpoint) {
       onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
@@ -1951,7 +2012,22 @@ function makeHeartbeatBytes(): Uint8Array {
 
 function computeUsage(state: StreamState) {
   const completion_tokens = state.outputTokens;
-  const total_tokens = state.totalTokens || completion_tokens;
+  const usedTokens = state.totalTokens || completion_tokens;
+
+  // If Cursor enforces a tighter context window than we inferred, scale
+  // total_tokens proportionally so pi's compaction threshold fires before
+  // Cursor errors — rather than after.
+  //
+  // Example: Cursor caps Gemini at 200 k but we registered 1 M.
+  //   usedTokens=197k → total_tokens = round(197k × 1M/200k) = 985k
+  //   985k > 1M − 16k (reserveTokens) → pi triggers compaction ✓
+  let total_tokens = usedTokens;
+  const cursorWindow = state.cursorContextWindow;
+  const piWindow = state.inferredContextWindow;
+  if (cursorWindow > 0 && piWindow > cursorWindow) {
+    total_tokens = Math.round(usedTokens * piWindow / cursorWindow);
+  }
+
   const prompt_tokens = Math.max(0, total_tokens - completion_tokens);
   return { prompt_tokens, completion_tokens, total_tokens };
 }
@@ -2175,11 +2251,14 @@ function writeSSEStream(
     };
   };
 
+  const storedForState = conversationStates.get(convKey);
   const state: StreamState = {
     toolCallIndex: 0,
     pendingExecs: [],
     outputTokens: 0,
     totalTokens: 0,
+    cursorContextWindow: storedForState?.effectiveContextWindow ?? 0,
+    inferredContextWindow: inferContextWindow(modelId),
   };
   const tagFilter = createThinkingTagFilter();
   let mcpExecReceived = false;
@@ -2285,7 +2364,9 @@ function writeSSEStream(
             if (stored) {
               stored.checkpoint = checkpointBytes;
               for (const [k, v] of blobStore) stored.blobStore.set(k, v);
-
+              if (state.cursorContextWindow > 0) {
+                stored.effectiveContextWindow = state.cursorContextWindow;
+              }
             }
             debugLog("stream.checkpoint_buffered", {
               requestId,
@@ -2359,6 +2440,9 @@ function writeSSEStream(
       if (!cancelled && latestCheckpoint) {
         stored.checkpoint = latestCheckpoint;
         debugLog("stream.checkpoint_committed", { requestId, convKey, stored });
+      }
+      if (state.cursorContextWindow > 0) {
+        stored.effectiveContextWindow = state.cursorContextWindow;
       }
     }
     if (cancelled) return;
@@ -2577,11 +2661,14 @@ async function handleNonStreamingResponse(
   };
   req.on("close", onClientClose);
   res.on("close", onClientClose);
+  const storedForNonStream = conversationStates.get(convKey);
   const state: StreamState = {
     toolCallIndex: 0,
     pendingExecs: [],
     outputTokens: 0,
     totalTokens: 0,
+    cursorContextWindow: storedForNonStream?.effectiveContextWindow ?? 0,
+    inferredContextWindow: inferContextWindow(modelId),
   };
   const tagFilter = createThinkingTagFilter();
   let fullText = "";
@@ -2704,6 +2791,9 @@ async function handleNonStreamingResponse(
             convKey,
             stored,
           });
+        }
+        if (state.cursorContextWindow > 0) {
+          stored.effectiveContextWindow = state.cursorContextWindow;
         }
       }
 
