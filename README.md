@@ -1,6 +1,6 @@
 # pi-cursor-provider
 
-> **This fork improves on the upstream in six areas:** image support, correct `pi -p` exit behaviour, removal of dead eviction code, accurate per-model context window inference, post-compaction session sync, and context window scaling when Cursor enforces a tighter cap. See the sections below for details.
+> **This fork improves on the upstream in ten areas:** image support, correct `pi -p` exit behaviour, removal of dead eviction code, accurate per-model context window inference, post-compaction session sync, context window scaling when Cursor enforces a tighter cap, per-model cost estimation, model deduplication with reasoning-effort mapping, thinking-tag filtering, and structured debug logging. See the sections below for details.
 
 [![npm version](https://img.shields.io/npm/v/@offbynan/pi-cursor-provider.svg)](https://www.npmjs.com/package/@offbynan/pi-cursor-provider)
 
@@ -69,6 +69,32 @@ total_tokens = round(usedTokens × piWindow / cursorWindow)
 ```
 
 That makes pi's compaction threshold fire at the right time relative to the window Cursor is actually enforcing.
+
+### Per-model cost estimation
+
+The upstream repo provides no cost data, so pi cannot show per-turn cost estimates for Cursor models.
+
+This fork ships a detailed cost table (input / output / cache-read / cache-write prices in $/M tokens) covering every current model family — Claude 4.x, GPT-5.x, Gemini 2.5/3.x, Grok 4, Kimi K2, and Composer — plus a pattern-based fallback for variants not yet in the table. Pi uses this data to display cost estimates after each turn.
+
+### Model deduplication with reasoning-effort mapping
+
+Cursor's `GetUsableModels` RPC can return dozens of near-duplicate IDs that differ only by effort suffix (e.g. `gpt-5.4-low`, `gpt-5.4-medium`, `gpt-5.4-high`, `gpt-5.4-xhigh`). The upstream passes all of these through verbatim, producing a cluttered model list where the user must manually pick the right suffix and pi's reasoning-effort setting is ignored.
+
+This fork deduplicates them: model variants that share the same base ID and differ only by effort suffix are collapsed into a single entry with `supportsReasoningEffort: true` and an effort map keyed by pi's reasoning levels (`minimal` / `low` / `medium` / `high` / `xhigh`). Pi's thinking-level setting then drives the effort suffix automatically, and the model list stays manageable. See the [Model Mapping](#model-mapping) section for the full deduplication rules.
+
+### Thinking-tag filtering
+
+Some models (notably certain Gemini variants) emit reasoning content inline with the response, wrapped in tags like `<think>`, `<thinking>`, `<reasoning>`, or `<thought>`. The upstream passes this through as raw text, polluting the main response with unrendered XML tags.
+
+This fork detects and strips these tags in the proxy's stream processor, routing the extracted content to the `reasoning_content` SSE field so pi renders it as structured reasoning rather than as part of the assistant's reply.
+
+### Structured debug logging
+
+The upstream has no observability. This fork adds opt-in JSONL event logging (set `PI_CURSOR_PROVIDER_DEBUG=1`) covering every stage of a request: HTTP ingress, message parsing, checkpoint reads/writes, bridge lifecycle, tool call pauses, tool result resumes, and stream completion. A bundled `debug:timeline` script converts a raw log file into a compact human-readable timeline for diagnosing proxy behaviour.
+
+```bash
+npm run debug:timeline -- --latest
+```
 
 ## How it works
 
