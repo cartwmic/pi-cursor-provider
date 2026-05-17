@@ -1,6 +1,19 @@
 # pi-cursor-provider
 
-> **This fork improves on the upstream in ten areas:** image support, correct `pi -p` exit behaviour, removal of dead eviction code, accurate per-model context window inference, post-compaction session sync, context window scaling when Cursor enforces a tighter cap, per-model cost estimation, model deduplication with reasoning-effort mapping, thinking-tag filtering, and structured debug logging. See the sections below for details.
+**This fork improves on the upstream in ten areas:**
+
+- **Image support** — base64 `image_url` content parts are forwarded to Cursor end-to-end; the upstream silently drops them
+- **`pi -p` exit fix** — non-interactive mode no longer hangs after printing a response
+- **Dead eviction code removed** — unreachable 30-minute TTL eviction logic is gone
+- **Accurate context windows** — per-model inference instead of a hardcoded 200 k for every model
+- **Post-compaction sync** — cached checkpoint is cleared on `session_compact` so both sides stay in sync
+- **Context window scaling** — token counts are scaled when Cursor enforces a tighter runtime cap than the model implies
+- **Per-model cost estimation** — detailed price table (input / output / cache) covering all current model families
+- **Model deduplication** — effort-suffix variants (`-low`, `-medium`, `-high`, …) are collapsed into one entry; pi's reasoning-level setting drives the suffix automatically
+- **Thinking-tag filtering** — inline `<think>` / `<reasoning>` tags are stripped from the response and routed to `reasoning_content`
+- **Structured debug logging** — opt-in JSONL event log (`PI_CURSOR_PROVIDER_DEBUG=1`) with a bundled timeline viewer
+
+See the sections below for details.
 
 [![npm version](https://img.shields.io/npm/v/@offbynan/pi-cursor-provider.svg)](https://www.npmjs.com/package/@offbynan/pi-cursor-provider)
 
