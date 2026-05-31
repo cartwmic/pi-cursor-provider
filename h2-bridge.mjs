@@ -91,11 +91,16 @@ const client = http2.connect(url || "https://api2.cursor.sh");
 
 // Guard against initial connection failure. Reset on any h2 activity
 // so long-running agent conversations (with tool call round-trips) survive.
-let timeout = setTimeout(killBridge, 30_000);
+// Initial timeout is generous because large conversations require Cursor to
+// deserialize a big checkpoint + run many getBlobArgs round-trips before it
+// starts streaming tokens — 30 s was too short and caused compaction failures.
+const INITIAL_TIMEOUT_MS = parseInt(process.env.PI_CURSOR_BRIDGE_INITIAL_TIMEOUT_MS ?? "") || 120_000;
+const ACTIVITY_TIMEOUT_MS = parseInt(process.env.PI_CURSOR_BRIDGE_ACTIVITY_TIMEOUT_MS ?? "") || 300_000;
+let timeout = setTimeout(killBridge, INITIAL_TIMEOUT_MS);
 
 function resetTimeout() {
   clearTimeout(timeout);
-  timeout = setTimeout(killBridge, 120_000);
+  timeout = setTimeout(killBridge, ACTIVITY_TIMEOUT_MS);
 }
 
 function killBridge() {

@@ -1,6 +1,6 @@
 # pi-cursor-provider
 
-**This fork improves on the upstream in ten areas:**
+**This fork improves on the upstream in thirteen areas:**
 
 - **Image support** — base64 `image_url` content parts are forwarded to Cursor end-to-end; the upstream silently drops them
 - **`pi -p` exit fix** — non-interactive mode no longer hangs after printing a response
@@ -12,6 +12,9 @@
 - **Model deduplication** — effort-suffix variants (`-low`, `-medium`, `-high`, …) are collapsed into one entry; pi's reasoning-level setting drives the suffix automatically
 - **Thinking-tag filtering** — inline `<think>` / `<reasoning>` tags are stripped from the response and routed to `reasoning_content`
 - **Structured debug logging** — opt-in JSONL event log (`PI_CURSOR_PROVIDER_DEBUG=1`) with a bundled timeline viewer
+- **Bridge timeout hardening** — initial and activity timeouts raised and made configurable so large checkpoints don't cause premature bridge termination during compaction
+- **Bridge termination error propagation** — a bridge crash now surfaces as a real error to pi instead of returning a silent empty success, preventing compaction failures from appearing as blank responses
+- **Conversation history archiving** — turns beyond a configurable tail are folded into a `ConversationSummaryArchive` blob with inline text, capping `getBlobArgs` round-trips at O(tail) instead of O(history length) and dramatically speeding up compaction on long sessions
 
 See the sections below for details.
 
@@ -108,6 +111,45 @@ The upstream has no observability. This fork adds opt-in JSONL event logging (se
 ```bash
 npm run debug:timeline -- --latest
 ```
+
+### Bridge timeout hardening
+
+The upstream `h2-bridge.mjs` used a 30-second initial connection timeout and a 120-second activity timeout. Large conversations require Cursor to deserialise a big checkpoint and complete many `getBlobArgs` round-trips before it starts streaming tokens, which regularly exceeded these limits and caused compaction to fail with a `terminated` error.
+
+This fork raises the defaults (120 s initial, 300 s activity) and makes them configurable:
+
+| Env var | Default | Purpose |
+| ------------------------------------------------ | ------- | ----------------------------------------- |
+| `PI_CURSOR_BRIDGE_INITIAL_TIMEOUT_MS` | 120 000 | Kill bridge if no h2 activity within this many ms of spawn |
+| `PI_CURSOR_BRIDGE_ACTIVITY_TIMEOUT_MS` | 300 000 | Kill bridge if no h2 activity for this many ms after the first frame |
+
+### Bridge termination error propagation
+
+In the upstream, if the `h2-bridge` child process exits before producing any response (e.g. due to a timeout), the proxy sends a `finish_reason: "stop"` with empty content on the streaming path, and a silent 200 OK on the non-streaming path. Pi receives what looks like a successful but empty response, then fails compaction with an opaque `terminated` error.
+
+This fork checks the bridge exit code in both paths:
+- **Streaming path** — if the bridge exits with code ≠ 0 before any response, an SSE error chunk is sent so pi surfaces a real failure.
+- **Non-streaming path** — same condition returns a 502 JSON error.
+- **Both paths** — the stale conversation state is evicted so the next request rebuilds cleanly rather than replaying a broken checkpoint.
+
+### Conversation history archiving
+
+Cursor's `AgentService/Run` RPC is stateless per request: each turn sends the full conversation state as a checkpoint blob, and the server fetches individual turn blobs via `getBlobArgs` as needed. For a long conversation every request incurs O(history) round-trips; the compaction turn is the worst case because Cursor must read the entire history to generate a summary.
+
+This fork folds turns older than a configurable tail into a single `ConversationSummaryArchive` protobuf blob that stores the transcript as **inline text**. The server reads one blob instead of hundreds, cutting round-trips from O(N) to O(tail):
+
+| Scenario | `getBlobArgs` before | `getBlobArgs` after |
+| ---------------------- | --------------------- | ------------------- |
+| 100-turn compaction | ~300 | ~61 |
+| 20-turn normal turn | ~60 | ~60 (unchanged) |
+
+The tail size (default 20) is configurable:
+
+```bash
+PI_CURSOR_TURN_ARCHIVE_THRESHOLD=30  # keep last 30 turns as raw blobs
+```
+
+Archiving is conservative: old turns are only replaced if every required blob is already in the local store. If any blob is missing the turns are left as-is, so no context is silently dropped.
 
 ## How it works
 

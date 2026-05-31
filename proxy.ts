@@ -78,6 +78,7 @@ import {
   WriteResultSchema,
   WriteShellStdinErrorSchema,
   WriteShellStdinResultSchema,
+  ConversationSummaryArchiveSchema,
   GetUsableModelsRequestSchema,
   GetUsableModelsResponseSchema,
   type AgentServerMessage,
@@ -1331,6 +1332,103 @@ function buildTurnStepBytes(step: ParsedTurnStep): Uint8Array {
   );
 }
 
+// Number of most-recent turns to keep as raw blobs; older turns are folded
+// into a ConversationSummaryArchive blob with inline text.  Keeping only the
+// tail as raw blobs caps the number of blob fetches the server needs per
+// request to O(THRESHOLD) instead of O(conversation_length), which is the
+// primary driver of compaction slowness for long sessions.
+const TURN_ARCHIVE_THRESHOLD =
+  parseInt(process.env.PI_CURSOR_TURN_ARCHIVE_THRESHOLD ?? "") || 20;
+
+/**
+ * Renders parsed turns (already-decoded OpenAI messages) as plain text for
+ * use as the `summary` field of a ConversationSummaryArchive.  Tool results
+ * are truncated so the archive blob stays small.
+ */
+function buildTurnsTranscript(turns: ParsedTurn[]): string {
+  const parts: string[] = [
+    `[Earlier conversation — ${turns.length} turn(s)]\n`,
+  ];
+  for (const [i, turn] of turns.entries()) {
+    parts.push(`Turn ${i + 1}:`);
+    if (turn.userText) parts.push(`User: ${turn.userText.slice(0, 1000)}`);
+    for (const step of turn.steps) {
+      if (step.kind === "assistantText") {
+        if (step.text) parts.push(`Assistant: ${step.text.slice(0, 800)}`);
+      } else if (step.kind === "toolCall") {
+        const argsStr = JSON.stringify(step.arguments).slice(0, 300);
+        parts.push(`Tool: ${step.toolName}(${argsStr})`);
+        if (step.result?.content) {
+          parts.push(`Result: ${step.result.content.slice(0, 400)}`);
+        }
+      }
+    }
+    parts.push("");
+  }
+  return parts.join("\n");
+}
+
+/**
+ * Extracts a human-readable transcript of a single turn from the blob store.
+ * Returns null if required blobs are missing (turn is left as a raw blob).
+ */
+function extractTextFromTurnBlob(
+  turnBlobId: Uint8Array,
+  blobStore: Map<string, Uint8Array>,
+): string | null {
+  try {
+    const turnData = blobStore.get(Buffer.from(turnBlobId).toString("hex"));
+    if (!turnData) return null;
+
+    const turnStructure = fromBinary(ConversationTurnStructureSchema, turnData);
+    if (turnStructure.turn.case !== "agentConversationTurn") return null;
+
+    const agentTurn = turnStructure.turn.value;
+    const lines: string[] = [];
+
+    const userMsgData = blobStore.get(
+      Buffer.from(agentTurn.userMessage).toString("hex"),
+    );
+    if (userMsgData) {
+      const userMsg = fromBinary(UserMessageSchema, userMsgData);
+      if (userMsg.text) lines.push(`User: ${userMsg.text.slice(0, 1000)}`);
+    } else {
+      return null; // can't represent this turn without its user message
+    }
+
+    for (const stepBlobId of agentTurn.steps) {
+      const stepData = blobStore.get(
+        Buffer.from(stepBlobId).toString("hex"),
+      );
+      if (!stepData) continue;
+      const step = fromBinary(ConversationStepSchema, stepData);
+      if (step.message.case === "assistantMessage") {
+        const text = step.message.value.text;
+        if (text) lines.push(`Assistant: ${text.slice(0, 800)}`);
+      } else if (step.message.case === "toolCall") {
+        const tc = step.message.value;
+        if (tc.tool.case === "mcpToolCall") {
+          const mcp = tc.tool.value;
+          const name = mcp.args?.name ?? "tool";
+          lines.push(`Tool: ${name}`);
+          if (mcp.result?.result.case === "success") {
+            const content = mcp.result.result.value.content
+              .map((c) =>
+                c.content.case === "text" ? c.content.value.text : "",
+              )
+              .join("")
+              .slice(0, 400);
+            if (content) lines.push(`Result: ${content}`);
+          }
+        }
+      }
+    }
+    return lines.join("\n") || null;
+  } catch {
+    return null;
+  }
+}
+
 export function buildCursorRequest(
   modelId: string,
   systemPrompt: string,
@@ -1367,9 +1465,90 @@ export function buildCursorRequest(
       ConversationStateStructureSchema,
       checkpoint,
     );
+    // Archive old turns from the checkpoint when the tail is too long.
+    // Each raw turn blob requires ~3 getBlobArgs round-trips from the server;
+    // replacing old turns with a single ConversationSummaryArchive blob (inline
+    // text) cuts that to 1 fetch for all archived history.
+    if (conversationState.turns.length > TURN_ARCHIVE_THRESHOLD) {
+      const oldTurnIds = conversationState.turns.slice(
+        0,
+        conversationState.turns.length - TURN_ARCHIVE_THRESHOLD,
+      );
+      const recentTurnIds = conversationState.turns.slice(
+        -TURN_ARCHIVE_THRESHOLD,
+      );
+
+      const archiveLines: string[] = [
+        `[Earlier conversation \u2014 ${oldTurnIds.length} turn(s)]\n`,
+      ];
+      let archivedCount = 0;
+      for (const [i, oldTurnId] of oldTurnIds.entries()) {
+        const text = extractTextFromTurnBlob(oldTurnId, blobStore);
+        if (text === null) continue; // blob missing — leave turn as-is
+        archiveLines.push(`Turn ${i + 1}:\n${text}`);
+        archiveLines.push("");
+        archivedCount++;
+      }
+
+      // Only replace turns with archive if we could represent all of them;
+      // a partial archive would silently drop context the server needs.
+      if (archivedCount === oldTurnIds.length) {
+        const archive = create(ConversationSummaryArchiveSchema, {
+          summarizedMessages: oldTurnIds,
+          summary: archiveLines.join("\n"),
+          windowTail: oldTurnIds.length,
+          summaryMessage: new Uint8Array(0),
+        });
+        const archiveBlobId = storeAsBlob(
+          toBinary(ConversationSummaryArchiveSchema, archive),
+          blobStore,
+        );
+        conversationState.turns = recentTurnIds;
+        conversationState.summaryArchives = [
+          ...conversationState.summaryArchives,
+          archiveBlobId,
+        ];
+        debugLog("cursor_request.turns_archived", {
+          archivedCount,
+          remaining: recentTurnIds.length,
+          totalArchives: conversationState.summaryArchives.length,
+        });
+      }
+    }
   } else {
+    // When rebuilding from scratch (no checkpoint), archive old parsed turns
+    // directly — we have their text, no blob parsing needed.
+    const olderTurns =
+      turns.length > TURN_ARCHIVE_THRESHOLD
+        ? turns.slice(0, turns.length - TURN_ARCHIVE_THRESHOLD)
+        : [];
+    const recentTurns =
+      turns.length > TURN_ARCHIVE_THRESHOLD
+        ? turns.slice(-TURN_ARCHIVE_THRESHOLD)
+        : turns;
+
+    const summaryArchives: Uint8Array[] = [];
+    if (olderTurns.length > 0) {
+      const archive = create(ConversationSummaryArchiveSchema, {
+        summarizedMessages: [], // no blob IDs yet — turns haven't been stored
+        summary: buildTurnsTranscript(olderTurns),
+        windowTail: olderTurns.length,
+        summaryMessage: new Uint8Array(0),
+      });
+      summaryArchives.push(
+        storeAsBlob(
+          toBinary(ConversationSummaryArchiveSchema, archive),
+          blobStore,
+        ),
+      );
+      debugLog("cursor_request.turns_archived_from_scratch", {
+        archivedCount: olderTurns.length,
+        remaining: recentTurns.length,
+      });
+    }
+
     const turnBlobIds: Uint8Array[] = [];
-    for (const turn of turns) {
+    for (const turn of recentTurns) {
       const userMsg = createUserMessage(
         turn.userText,
         selectedCtxBlob,
@@ -1408,7 +1587,7 @@ export function buildCursorRequest(
       mode: 1,
       fileStates: {},
       fileStatesV2: {},
-      summaryArchives: [],
+      summaryArchives,
       turnTimings: [],
       subagentStates: {},
       selfSummaryCount: 0,
@@ -2447,17 +2626,32 @@ function writeSSEStream(
     }
     if (cancelled) return;
     if (!mcpExecReceived) {
-      const flushed = tagFilter.flush();
-      if (flushed.reasoning)
-        sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-      if (flushed.content) {
-        appendAssistantTextToTurn(currentTurn, flushed.content);
-        sendSSE(makeChunk({ content: flushed.content }));
+      if (code !== 0) {
+        // Bridge was killed before receiving any response (e.g. timeout waiting
+        // for Cursor to process a large checkpoint during compaction). Treat as
+        // an error so callers (like pi compaction) see a real failure instead of
+        // an empty successful-looking response.
+        console.error(
+          `[cursor-provider] Bridge exited (code ${code}) before receiving response (${modelId})`,
+        );
+        conversationStates.delete(convKey);
+        sendSSE(makeChunk({ content: `Cursor bridge terminated (exit ${code}) before response — try again or shorten the conversation` }, "error"));
+        sendSSE(makeUsageChunk());
+        sendDone();
+        closeResponse();
+      } else {
+        const flushed = tagFilter.flush();
+        if (flushed.reasoning)
+          sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+        if (flushed.content) {
+          appendAssistantTextToTurn(currentTurn, flushed.content);
+          sendSSE(makeChunk({ content: flushed.content }));
+        }
+        sendSSE(makeChunk({}, "stop"));
+        sendSSE(makeUsageChunk());
+        sendDone();
+        closeResponse();
       }
-      sendSSE(makeChunk({}, "stop"));
-      sendSSE(makeUsageChunk());
-      sendDone();
-      closeResponse();
     } else if (code !== 0) {
       sendSSE(makeChunk({ content: "Bridge connection lost" }, "error"));
       sendSSE(makeUsageChunk());
@@ -2769,10 +2963,11 @@ async function handleNonStreamingResponse(
       ),
     );
 
-    bridge.onClose(() => {
+    bridge.onClose((code) => {
       debugLog("nonstream.bridge_close", {
         requestId,
         convKey,
+        code,
         cancelled,
         nonStreamError: nonStreamError?.message,
         currentTurn,
@@ -2822,6 +3017,25 @@ async function handleNonStreamingResponse(
               message: nonStreamError.message,
               type: "upstream_error",
               code: "cursor_error",
+            },
+          }),
+        );
+        resolve();
+        return;
+      }
+
+      if (code !== 0) {
+        console.error(
+          `[cursor-provider] Bridge exited (code ${code}) before non-stream response (${modelId})`,
+        );
+        conversationStates.delete(convKey);
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: {
+              message: `Cursor bridge terminated (exit ${code}) before response — try again or shorten the conversation`,
+              type: "upstream_error",
+              code: "bridge_terminated",
             },
           }),
         );
