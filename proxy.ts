@@ -599,8 +599,9 @@ function decodeConnectUnaryBody(payload: Uint8Array): Uint8Array | null {
  * derive them from known model families.  Update when new major versions ship.
  *
  * Sources:
- *  - Claude: platform.claude.ai/docs — claude-4.6-sonnet / claude-4.6-opus: 1M (GA Mar 2026);
- *    all other Claude incl. 4.5, 4, Haiku: 200k.
+ *  - Claude: platform.claude.ai/docs — claude-4.6-sonnet / claude-4.6-opus: native 1M context
+ *    (GA Mar 2026), but Cursor enforces a 200k cap via ConversationTokenDetails.maxTokens.
+ *    Registered at 200k to match Cursor's actual limit; all other Claude incl. 4.5, 4, Haiku: 200k.
  *  - Gemini: ai.google.dev/gemini-api/docs — all 2.5 / 3.x models: 1M.
  *  - GPT: chatai.guide — GPT-5.x: 400k; GPT-5.5+: 1M; nano/mini variants: 128k.
  *  - Grok 4: docs.x.ai — 256k.
@@ -613,9 +614,9 @@ export function inferContextWindow(id: string): number {
   if (lower.includes("-1m")) return 1_048_576;
 
   // ── Claude ────────────────────────────────────────────────────────────────
-  // Sonnet 4.6 and Opus 4.6 gained 1M context (GA March 2026).
-  // All earlier versions (4.5, 4, …) and Haiku remain at 200k.
-  if (lower.startsWith("claude-4.6-sonnet") || lower.startsWith("claude-4.6-opus")) return 1_048_576;
+  // Sonnet 4.6 / Opus 4.6 natively support 1M but Cursor enforces 200k server-side.
+  // Registering at 200k avoids spurious 5× scaling in computeUsage.
+  // All other Claude (4.5, 4, Haiku, …) are also 200k.
   if (lower.startsWith("claude-")) return 200_000;
 
   // ── Gemini ────────────────────────────────────────────────────────────────
