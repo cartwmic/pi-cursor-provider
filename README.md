@@ -1,6 +1,6 @@
 # pi-cursor-provider
 
-**This fork improves on the upstream in thirteen areas:**
+**This fork improves on the upstream in sixteen areas:**
 
 - **Image support** — base64 `image_url` content parts are forwarded to Cursor end-to-end; the upstream silently drops them
 - **`pi -p` exit fix** — non-interactive mode no longer hangs after printing a response
@@ -15,6 +15,9 @@
 - **Bridge timeout hardening** — initial and activity timeouts raised and made configurable so large checkpoints don't cause premature bridge termination during compaction
 - **Bridge termination error propagation** — a bridge crash now surfaces as a real error to pi instead of returning a silent empty success, preventing compaction failures from appearing as blank responses
 - **Conversation history archiving** — turns beyond a configurable tail are folded into a `ConversationSummaryArchive` blob with inline text, capping `getBlobArgs` round-trips at O(tail) instead of O(history length) and dramatically speeding up compaction on long sessions
+- **SSE keepalive during blob-fetching** — periodic `: ping` comments keep the SSE connection alive while Cursor is fetching blobs, preventing pi's request timeout from firing before the first token arrives
+- **Conversation state preserved on transient errors** — a bridge timeout or Connect error no longer wipes the conversation state; the last good checkpoint survives so the next request resumes in-place instead of rebuilding from scratch
+- **Checkpoint saved on client disconnect** — if pi closes the connection (e.g. request timeout) after Cursor already sent a checkpoint, that checkpoint is preserved for the retry
 
 See the sections below for details.
 
@@ -130,7 +133,7 @@ In the upstream, if the `h2-bridge` child process exits before producing any res
 This fork checks the bridge exit code in both paths:
 - **Streaming path** — if the bridge exits with code ≠ 0 before any response, an SSE error chunk is sent so pi surfaces a real failure.
 - **Non-streaming path** — same condition returns a 502 JSON error.
-- **Both paths** — the stale conversation state is evicted so the next request rebuilds cleanly rather than replaying a broken checkpoint.
+- **Both paths** — the conversation state is preserved so the next retry can resume from the last good checkpoint rather than rebuilding from scratch.
 
 ### Conversation history archiving
 
@@ -150,6 +153,26 @@ PI_CURSOR_TURN_ARCHIVE_THRESHOLD=30  # keep last 30 turns as raw blobs
 ```
 
 Archiving is conservative: old turns are only replaced if every required blob is already in the local store. If any blob is missing the turns are left as-is, so no context is silently dropped.
+
+### SSE keepalive during blob-fetching
+
+Before the first token arrives, the proxy is silent: it sends HTTP 200 headers immediately but emits no SSE events while Cursor fetches conversation blobs. If pi's HTTP client has a request timeout (or a "time since last data" idle timeout), it fires during this window and the request is aborted with `Error: Request timed out.`
+
+This fork starts a 15-second keepalive timer alongside the SSE stream. While the response is open and no data has been sent yet, the timer periodically writes an SSE comment (`: ping`) which is invisible to pi's message parser but resets any inactivity timer in the HTTP layer.
+
+### Conversation state preserved on transient errors
+
+Previously, a bridge timeout (`exit code ≠ 0`) or a Connect-level error from Cursor caused the proxy to call `conversationStates.delete(convKey)`, wiping the stored checkpoint. On the next request pi would rebuild the Cursor conversation from scratch — losing any context accumulated since the last compaction.
+
+Neither failure mode actually invalidates the checkpoint. A bridge timeout means Cursor stopped responding to the current request, not that its conversation state is corrupt. A Connect error (e.g. rate limit, transient upstream failure) also leaves the prior checkpoint intact.
+
+This fork removes both deletes. The last good checkpoint survives errors, so the next request resumes from where the conversation was rather than starting over.
+
+### Checkpoint saved on client disconnect
+
+When pi closes the SSE connection (e.g. its own request timeout fires), the proxy previously guarded checkpoint persistence behind `if (!cancelled)`, discarding any checkpoint that Cursor had already sent for that turn. On the next request the proxy used a stale checkpoint, losing the partial turn's context.
+
+This fork removes the `!cancelled` guard. If Cursor sent a checkpoint before the disconnect, it is saved and the retry picks it up.
 
 ## How it works
 

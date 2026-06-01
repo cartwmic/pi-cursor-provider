@@ -2392,6 +2392,7 @@ function writeSSEStream(
   });
 
   let closed = false;
+  let keepAliveTimer: ReturnType<typeof setInterval> | undefined;
   const sendSSE = (data: object) => {
     if (closed) return;
     res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -2403,6 +2404,7 @@ function writeSSEStream(
   const closeResponse = () => {
     if (closed) return;
     closed = true;
+    clearInterval(keepAliveTimer);
     res.end();
   };
 
@@ -2443,6 +2445,13 @@ function writeSSEStream(
   let mcpExecReceived = false;
   let cancelled = false;
   let latestCheckpoint: Uint8Array | null = null;
+
+  // Keep the SSE connection alive during the silent blob-fetching phase so
+  // pi's request timeout does not fire before the first token arrives.
+  keepAliveTimer = setInterval(() => {
+    if (!closed) res.write(": ping\n\n");
+  }, 15_000);
+  keepAliveTimer.unref();
 
   // Detect client disconnect (e.g. user pressed Escape in pi)
   const onClientClose = () => {
@@ -2573,7 +2582,6 @@ function writeSSEStream(
           `[cursor-provider] Cursor stream error (${modelId}):`,
           endError.message,
         );
-        conversationStates.delete(convKey);
         sendSSE(makeChunk({ content: endError.message }, "error"));
         sendSSE(makeUsageChunk());
         sendDone();
@@ -2616,7 +2624,7 @@ function writeSSEStream(
     const stored = conversationStates.get(convKey);
     if (stored) {
       for (const [k, v] of blobStore) stored.blobStore.set(k, v);
-      if (!cancelled && latestCheckpoint) {
+      if (latestCheckpoint) {
         stored.checkpoint = latestCheckpoint;
         debugLog("stream.checkpoint_committed", { requestId, convKey, stored });
       }
@@ -2634,7 +2642,6 @@ function writeSSEStream(
         console.error(
           `[cursor-provider] Bridge exited (code ${code}) before receiving response (${modelId})`,
         );
-        conversationStates.delete(convKey);
         sendSSE(makeChunk({ content: `Cursor bridge terminated (exit ${code}) before response — try again or shorten the conversation` }, "error"));
         sendSSE(makeUsageChunk());
         sendDone();
@@ -2956,7 +2963,6 @@ async function handleNonStreamingResponse(
               `[cursor-provider] Cursor non-stream error (${modelId}):`,
               endError.message,
             );
-            conversationStates.delete(convKey);
             nonStreamError = endError;
           }
         },
@@ -2979,7 +2985,7 @@ async function handleNonStreamingResponse(
       const stored = conversationStates.get(convKey);
       if (stored) {
         for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
-        if (!cancelled && !nonStreamError && latestCheckpoint) {
+        if (latestCheckpoint) {
           stored.checkpoint = latestCheckpoint;
           debugLog("nonstream.checkpoint_committed", {
             requestId,
@@ -3028,7 +3034,6 @@ async function handleNonStreamingResponse(
         console.error(
           `[cursor-provider] Bridge exited (code ${code}) before non-stream response (${modelId})`,
         );
-        conversationStates.delete(convKey);
         res.writeHead(502, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
