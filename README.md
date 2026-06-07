@@ -4,7 +4,7 @@
 
 - **Image support** — base64 `image_url` content parts forwarded to Cursor end-to-end; the upstream silently drops them
 - **Compaction support** — old turns archived as inline text to cut `getBlobArgs` round-trips from O(history) to O(tail); bridge termination errors surface as real failures instead of silent empty responses; checkpoint cleared after compaction to keep both sides in sync
-- **Reliability** — bridge timeouts hardened and configurable; SSE keepalive prevents pi from timing out during blob-fetching; conversation state and checkpoints survive transient failures and client disconnects
+- **Reliability** — transparent retry for transient Cursor protocol errors (internal / unavailable / deadline_exceeded); HTTP/2 PING keepalive detects dead connections; stall timer kills stuck bridges; bridge timeouts hardened and configurable; SSE keepalive prevents pi from timing out during blob-fetching; conversation state and checkpoints survive transient failures and client disconnects
 - **Model support** — per-model context window inference (vs. hardcoded 200 k); runtime cap scaling when Cursor enforces a tighter window; detailed cost table for all current families; effort-suffix variants deduplicated so pi's reasoning-level setting drives the suffix automatically
 - **Thinking-tag filtering** — inline `<think>` / `<reasoning>` tags stripped from the response and routed to `reasoning_content`
 - **Fixes & observability** — `pi -p` exit hang fixed; dead TTL eviction code removed; opt-in JSONL debug logging with a bundled timeline viewer
@@ -59,6 +59,10 @@ pi  →  openai-completions  →  localhost:PORT/v1/chat/completions
 | `PI_CURSOR_PROVIDER_DEBUG_FILE` | auto in tmpdir | Override the debug log file path |
 | `PI_CURSOR_BRIDGE_INITIAL_TIMEOUT_MS` | `120000` | Kill bridge if no HTTP/2 activity within this many ms of spawn |
 | `PI_CURSOR_BRIDGE_ACTIVITY_TIMEOUT_MS` | `300000` | Kill bridge if no HTTP/2 activity for this many ms after the first frame |
+| `PI_CURSOR_BRIDGE_PING_INTERVAL_MS` | `15000` | HTTP/2 PING interval to detect dead connections |
+| `PI_CURSOR_BRIDGE_PING_TIMEOUT_MS` | `10000` | Timeout for each HTTP/2 PING before declaring the connection dead |
+| `PI_CURSOR_BRIDGE_STALL_TIMEOUT_MS` | `120000` | Kill bridge if no data received from Cursor within this many ms |
+| `PI_CURSOR_MAX_BRIDGE_RETRIES` | `2` | Max transparent retries on transient Cursor errors or bridge crashes |
 | `PI_CURSOR_TURN_ARCHIVE_THRESHOLD` | `20` | Keep this many recent turns as raw blobs; older turns are archived as inline text |
 | `PI_CURSOR_RAW_MODELS` | off | Set to disable model deduplication and see all raw Cursor model IDs |
 
@@ -149,6 +153,24 @@ The upstream has no observability. This fork adds opt-in JSONL event logging (se
 ```bash
 npm run debug:timeline -- --latest
 ```
+
+### Transparent retry for transient errors
+
+When Cursor returns a retryable Connect-level error (`internal`, `unavailable`, `deadline_exceeded`) or the bridge process crashes mid-request, the proxy now automatically retries on a fresh HTTP/2 bridge — up to `PI_CURSOR_MAX_BRIDGE_RETRIES` times (default 2). The SSE response to pi stays open; the client sees at most a brief pause.
+
+Retry is only attempted when no content has been streamed yet (so partial responses are never replayed). On retry the proxy rebuilds the Cursor request using the pre-turn checkpoint and replays cleanly.
+
+Previously these transient errors were surfaced as `finish_reason: "error"`, requiring the user to manually continue each time.
+
+### HTTP/2 PING keepalive and stall detection
+
+The bridge now configures HTTP/2-level PINGs (`PI_CURSOR_BRIDGE_PING_INTERVAL_MS` / `PI_CURSOR_BRIDGE_PING_TIMEOUT_MS`) so dead TCP connections (NAT timeout, load-balancer cycling) are detected within seconds rather than waiting for the 5-minute activity timeout.
+
+Additionally, a stall timer (`PI_CURSOR_BRIDGE_STALL_TIMEOUT_MS`, default 120 s) kills the bridge if no data arrives from Cursor — catching cases where the HTTP/2 connection is technically alive but the server is stuck processing a stale checkpoint.
+
+### Usage reporting on tool-call continuations
+
+When the proxy pauses mid-turn for a tool call and responds with pending tool calls (the partial-wait path), it now reports meaningful `usage` token counts instead of zeros. The stored `lastTotalTokens` from the previous stream segment is scaled proportionally if Cursor is enforcing a tighter context window than the model's nominal size. This lets pi track cumulative token usage accurately across multi-step tool-call turns.
 
 ### Bridge timeout hardening
 
@@ -276,7 +298,7 @@ Session state is cleared on pi lifecycle events — session switch, fork, `/tree
 
 ### Error resilience
 
-A bridge timeout or Connect-level error from Cursor does not wipe the stored checkpoint. The last good checkpoint survives transient failures and is used on the next retry. If Cursor sends a checkpoint before a client disconnect, that checkpoint is also preserved.
+Transient Cursor errors (`internal`, `unavailable`, `deadline_exceeded`) and bridge crashes are retried automatically — up to `PI_CURSOR_MAX_BRIDGE_RETRIES` times — without dropping the SSE connection to pi. The last good checkpoint survives all error types and is used on retry. If Cursor sends a checkpoint before a client disconnect, that checkpoint is also preserved.
 
 ## Requirements
 
