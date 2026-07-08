@@ -1,6 +1,6 @@
 {
   "name": "@offbynan/pi-cursor-provider",
-  "version": "0.5.3",
+  "version": "0.6.0",
   "description": "Pi extension providing access to Cursor models via OAuth and a local OpenAI-compatible gRPC proxy",
   "type": "module",
   "license": "MIT",
@@ -50,6 +50,8 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "refresh-models": "node scripts/refresh-models.mjs",
     "debug:timeline": "node scripts/debug-log-timeline.mjs"
   },
   "devDependencies": {

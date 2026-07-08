@@ -20,8 +20,14 @@ import {
 } from "node:http";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { resolve as pathResolve, dirname, join as pathJoin } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -603,51 +609,114 @@ export interface CursorModel {
   maxTokens: number;
 }
 
+// On-disk cache of the last successfully discovered model list. Used as the
+// synchronous fallback at startup so a fresh process registers the real,
+// up-to-date models (not the stale bundled snapshot) before Pi resolves
+// enabledModels — otherwise newer models (e.g. Opus 4.8) silently "disappear".
+const MODEL_CACHE_DIR = pathJoin(homedir(), ".pi", "agent");
+const MODEL_CACHE_PATH = pathJoin(MODEL_CACHE_DIR, "cursor-models-cache.json");
+// Re-run discovery when the in-memory list is older than this, so long-lived
+// processes pick up models Cursor adds mid-session.
+const MODEL_CACHE_TTL_MS = 30 * 60_000;
+const DISCOVERY_TIMEOUT_MS = 15_000;
+const DISCOVERY_ATTEMPTS = 3;
+
 let cachedModels: CursorModel[] | null = null;
+let cachedModelsAt = 0;
+
+/** Load the last discovered model list from disk, if any. */
+export function loadCachedModels(): CursorModel[] | null {
+  try {
+    const parsed = JSON.parse(readFileSync(MODEL_CACHE_PATH, "utf-8")) as {
+      models?: CursorModel[];
+    };
+    return Array.isArray(parsed?.models) && parsed.models.length > 0
+      ? parsed.models
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveCachedModels(models: CursorModel[]): void {
+  try {
+    if (!existsSync(MODEL_CACHE_DIR)) mkdirSync(MODEL_CACHE_DIR, { recursive: true });
+    writeFileSync(
+      MODEL_CACHE_PATH,
+      JSON.stringify({ savedAt: Date.now(), models }, null, 2),
+      "utf-8",
+    );
+  } catch {
+    // Cache is best-effort; a write failure must not break discovery.
+  }
+}
+
+/** Single discovery attempt. Returns the model list, or null on any failure. */
+async function discoverCursorModelsOnce(
+  apiKey: string,
+): Promise<CursorModel[] | null> {
+  const requestPayload = create(GetUsableModelsRequestSchema, {});
+  const requestBody = toBinary(GetUsableModelsRequestSchema, requestPayload);
+  const response = await callCursorUnaryRpc({
+    accessToken: apiKey,
+    rpcPath: "/agent.v1.AgentService/GetUsableModels",
+    requestBody,
+    timeoutMs: DISCOVERY_TIMEOUT_MS,
+  });
+  if (
+    response.timedOut ||
+    response.exitCode !== 0 ||
+    response.body.length === 0
+  ) {
+    return null;
+  }
+  let decoded: ReturnType<typeof fromBinary<typeof GetUsableModelsResponseSchema>> | null = null;
+  try {
+    decoded = fromBinary(GetUsableModelsResponseSchema, response.body);
+  } catch {
+    // Try Connect framing
+    const body = decodeConnectUnaryBody(response.body);
+    if (body) {
+      try {
+        decoded = fromBinary(GetUsableModelsResponseSchema, body);
+      } catch {}
+    }
+  }
+  if (!decoded?.models?.length) return null;
+  const models = normalizeCursorModels(decoded.models);
+  return models.length > 0 ? models : null;
+}
 
 export async function getCursorModels(apiKey: string): Promise<CursorModel[]> {
-  if (cachedModels) return cachedModels;
-  try {
-    const requestPayload = create(GetUsableModelsRequestSchema, {});
-    const requestBody = toBinary(GetUsableModelsRequestSchema, requestPayload);
-    const response = await callCursorUnaryRpc({
-      accessToken: apiKey,
-      rpcPath: "/agent.v1.AgentService/GetUsableModels",
-      requestBody,
-    });
-    if (
-      !response.timedOut &&
-      response.exitCode === 0 &&
-      response.body.length > 0
-    ) {
-      let decoded: ReturnType<typeof fromBinary<typeof GetUsableModelsResponseSchema>> | null = null;
-      try {
-        decoded = fromBinary(GetUsableModelsResponseSchema, response.body);
-      } catch {
-        // Try Connect framing
-        const body = decodeConnectUnaryBody(response.body);
-        if (body) {
-          try {
-            decoded = fromBinary(GetUsableModelsResponseSchema, body);
-          } catch {}
-        }
-      }
-      if (decoded?.models?.length) {
-        const models = normalizeCursorModels(decoded.models);
-        if (models.length > 0) {
-          cachedModels = models;
-          return models;
-        }
-      }
-    }
-  } catch (err) {
-    console.error(
-      "[cursor-provider] Model discovery failed:",
-      err instanceof Error ? err.message : err,
-    );
+  // Serve the in-memory list while it is still fresh.
+  if (cachedModels && Date.now() - cachedModelsAt < MODEL_CACHE_TTL_MS) {
+    return cachedModels;
   }
-  console.warn("[cursor-provider] Model discovery returned no models");
-  return [];
+  for (let attempt = 1; attempt <= DISCOVERY_ATTEMPTS; attempt++) {
+    try {
+      const models = await discoverCursorModelsOnce(apiKey);
+      if (models) {
+        cachedModels = models;
+        cachedModelsAt = Date.now();
+        saveCachedModels(models);
+        return models;
+      }
+    } catch (err) {
+      console.error(
+        "[cursor-provider] Model discovery failed:",
+        err instanceof Error ? err.message : err,
+      );
+    }
+    if (attempt < DISCOVERY_ATTEMPTS) {
+      await new Promise((r) => setTimeout(r, 500 * attempt));
+    }
+  }
+  console.warn(
+    "[cursor-provider] Model discovery returned no models; using cached/fallback list",
+  );
+  // Never regress to an empty list: prefer a stale in-memory list, then the
+  // on-disk cache. Returning [] would make previously-visible models vanish.
+  return cachedModels ?? loadCachedModels() ?? [];
 }
 
 function decodeConnectUnaryBody(payload: Uint8Array): Uint8Array | null {
