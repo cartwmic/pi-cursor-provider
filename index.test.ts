@@ -26,6 +26,7 @@ import {
   setBridgeFactoryForTests,
   startProxy,
   stopProxy,
+  summarizeSession,
   writeSSEStreamForTests,
 } from "./proxy.ts";
 import type { CursorModel, ParsedTurn } from "./proxy.ts";
@@ -1274,6 +1275,46 @@ describe("parseMessages — structured tool turns", () => {
   });
 });
 
+describe("parseMessages — injected-context coalescing", () => {
+  const marked = (body: string) => `<injected-context>\n${body}\n</injected-context>`;
+
+  test("merges a marked trailing user message into the preceding real prompt", () => {
+    const parsed = parseMessages([
+      { role: "system", content: "sys" },
+      { role: "user", content: "real prompt" },
+      { role: "user", content: marked("MEMORIES") },
+    ]);
+    // No separate history turn was created for the injected context.
+    expect(parsed.turns).toHaveLength(0);
+    // The real prompt survives and the memories are appended to the same turn.
+    expect(parsed.userText).toContain("real prompt");
+    expect(parsed.userText).toContain("MEMORIES");
+    expect(parsed.userText.indexOf("real prompt")).toBeLessThan(
+      parsed.userText.indexOf("MEMORIES"),
+    );
+  });
+
+  test("does NOT merge unmarked consecutive user messages (interrupt semantics)", () => {
+    const parsed = parseMessages([
+      { role: "system", content: "sys" },
+      { role: "user", content: "interrupt me" },
+      { role: "user", content: "continue" },
+    ]);
+    expect(parsed.userText).toBe("continue");
+    expect(parsed.turns).toHaveLength(1);
+    expect(parsed.turns[0]?.userText).toBe("interrupt me");
+  });
+
+  test("a lone injected-context message with no real prompt becomes its own turn", () => {
+    const parsed = parseMessages([
+      { role: "system", content: "sys" },
+      { role: "user", content: marked("ONLY MEMORIES") },
+    ]);
+    expect(parsed.userText).toContain("ONLY MEMORIES");
+    expect(parsed.turns).toHaveLength(0);
+  });
+});
+
 function frameConnectMessageForTest(data: Uint8Array, flags = 0): Buffer {
   const frame = Buffer.alloc(5 + data.length);
   frame[0] = flags;
@@ -2341,5 +2382,48 @@ describe("process exit safety (pi -p)", () => {
 
     expect(result.connectionHeader).toBe("close");
     expect(result.socketDestroyed).toBe(true);
+  });
+});
+
+describe("summarizeSession — native summarizeAction on compaction", () => {
+  test("sends a summarizeAction for a session with a checkpoint", async () => {
+    const sessionId = "session-summarize";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    // Seed a conversation with a (minimal, valid) checkpoint and a known model.
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv-sum",
+      checkpoint: toBinary(
+        ConversationStateStructureSchema,
+        create(ConversationStateStructureSchema, {}),
+      ),
+      blobStore: new Map(),
+      lastModelId: "gpt-5",
+    });
+
+    const runRequests: any[] = [];
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            runRequests.push(clientMessage.message.value);
+            fake.emitServerMessage(makeCheckpointMessage());
+            fake.close(0);
+          }
+        }),
+    );
+
+    await startProxy(async () => "test-token");
+    const ok = await summarizeSession(sessionId);
+
+    expect(ok).toBe(true);
+    expect(runRequests).toHaveLength(1);
+    expect(runRequests[0].action.action.case).toBe("summarizeAction");
+    // A real user turn is NOT sent on a summarize request.
+    expect(runRequests[0].action.action.case).not.toBe("userMessageAction");
+  });
+
+  test("no-ops (returns false) when the session has no checkpoint", async () => {
+    const ok = await summarizeSession("session-never-seen");
+    expect(ok).toBe(false);
   });
 });

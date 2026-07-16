@@ -33,6 +33,7 @@ import {
   inferContextWindow,
   loadCachedModels,
   startProxy,
+  summarizeSession,
   type CursorModel,
 } from "./proxy.js";
 
@@ -539,16 +540,26 @@ export function registerSessionLifecycleCleanup(pi: ExtensionAPI): void {
   pi.on("session_before_tree", cleanupCurrentSession);
   pi.on("session_shutdown", cleanupCurrentSession);
 
-  // After pi compacts its message list, keep the checkpoint intact.
-  // The checkpoint is the only thing that gives Cursor memory of prior turns;
-  // clearing it forces a rebuild from turns, which Cursor's server silently
-  // ignores (it doesn't fetch turn blobs from a synthetic state).  The
-  // checkpoint already reflects the full server-side conversation and remains
-  // valid regardless of what pi compacted locally.
-  pi.on("session_compact", (_event, ctx) => {
-    debugExtensionLog("session.post_compact_noop", {
-      sessionId: ctx.sessionManager.getSessionId(),
-    });
+  // After pi compacts (manual /compact or auto), trigger Cursor's native
+  // summarizeAction so the SERVER-SIDE conversation is actually compacted.
+  // Verified to cut usedTokens ~50-80% across composer/grok/gpt cursor models.
+  //
+  // Note: clearing/rebuilding the checkpoint does NOT work — Cursor's server
+  // ignores a synthetic conversation state. summarizeAction mutates Cursor's
+  // own authoritative state, so the reduction sticks and the checkpoint we
+  // capture from the response stays valid for subsequent turns.
+  pi.on("session_compact", async (_event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    debugExtensionLog("session.compact_summarize", { sessionId });
+    try {
+      const ok = await summarizeSession(sessionId);
+      debugExtensionLog("session.compact_summarize_done", { sessionId, ok });
+    } catch (err) {
+      debugExtensionLog("session.compact_summarize_error", {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   });
 }
 

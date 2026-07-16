@@ -1,5 +1,22 @@
 # pi-cursor-provider
 
+> **cartwmic fork** (of [offbynan/pi-cursor-provider](https://github.com/offbynan/pi-cursor-provider)) adds two fixes:
+>
+> 1. **Injected-context coalescing** — pi appends extension context (hindsight
+>    memories, goals) as a trailing `user` message after the real prompt. The
+>    proxy's `parseMessages` treated the *last* user message as the current
+>    prompt, silently demoting the real prompt into history (visible as "first
+>    message of a session sends only the injected block"). `parseMessages` now
+>    coalesces trailing user messages marked with pi's `<injected-context>`
+>    sentinel into the preceding real turn, while leaving genuine consecutive
+>    user messages (interrupts) on last-turn-wins. Requires the companion
+>    pi-core `custom-message-marker` patch that emits the sentinel.
+> 2. **Native compaction** — `session_compact` now sends Cursor's own
+>    `summarizeAction` (empirically cuts server-side `usedTokens` ~50-80% on
+>    composer/grok/gpt cursor models) instead of the previous no-op. A synthetic
+>    checkpoint rebuild does *not* work — Cursor ignores it — but summarizing its
+>    authoritative state does.
+
 **This fork improves on the upstream across six areas:**
 
 - **Image support** — base64 `image_url` content parts forwarded to Cursor end-to-end; the upstream silently drops them

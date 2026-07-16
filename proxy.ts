@@ -37,6 +37,7 @@ import {
   CancelActionSchema,
   ClientHeartbeatSchema,
   ConversationActionSchema,
+  SummarizeActionSchema,
   ConversationStateStructureSchema,
   ConversationStepSchema,
   AgentConversationTurnStructureSchema,
@@ -144,6 +145,13 @@ interface ChatCompletionRequest {
   reasoning_effort?: string;
   user?: string;
   pi_session_id?: string;
+  /**
+   * Internal loopback flag: when true, this request sends Cursor's native
+   * `summarizeAction` for the conversation instead of a user turn. Set by
+   * `summarizeSession()` in response to pi's `session_compact`. Not part of the
+   * OpenAI API surface.
+   */
+  pi_cursor_summarize?: boolean;
 }
 
 interface CursorRequestPayload {
@@ -207,6 +215,12 @@ export interface StoredConversation {
   lastTotalTokens?: number;
   /** Cached for transparent retry when a bridge dies mid-request. */
   systemPrompt?: string;
+  /**
+   * Last model id used on this conversation. Persisted so a session-level
+   * summarize (triggered outside an HTTP request, from `session_compact`) can
+   * reuse a valid model for the summarizeAction round-trip.
+   */
+  lastModelId?: string;
 }
 
 interface StreamState {
@@ -981,7 +995,7 @@ async function handleChatCompletion(
     stream: body.stream !== false,
   });
 
-  if (!userText && toolResults.length === 0) {
+  if (!userText && toolResults.length === 0 && !body.pi_cursor_summarize) {
     debugLog("chat.no_user_message", { requestId, messages: body.messages });
     res.writeHead(400, { "Content-Type": "application/json" });
     res.end(
@@ -1051,6 +1065,7 @@ async function handleChatCompletion(
   }
 
   stored.systemPrompt = systemPrompt;
+  stored.lastModelId = modelId;
 
   const mcpTools = buildMcpToolDefinitions(tools);
   const effectiveUserText =
@@ -1074,6 +1089,7 @@ async function handleChatCompletion(
     stored.checkpoint,
     stored.blobStore,
     userImages,
+    body.pi_cursor_summarize === true,
   );
   debugLog("chat.cursor_request", {
     requestId,
@@ -1180,6 +1196,19 @@ function stripTurnRuntimeState(
   return { userText: turn.userText, images: turn.images, steps: turn.steps };
 }
 
+/**
+ * Sentinel wrapping extension-injected context. pi-core's convertToLlm
+ * (the `custom-message-marker` pi-patch) wraps `custom` message content
+ * (hindsight memories, goals, etc.) in <injected-context> tags so stateful
+ * adapters can distinguish injected context from real user turns. Keep the tag
+ * in sync with that pi-patch.
+ */
+const INJECTED_CONTEXT_OPEN_TAG = "<injected-context>";
+
+function isInjectedContext(text: string): boolean {
+  return text.trimStart().startsWith(INJECTED_CONTEXT_OPEN_TAG);
+}
+
 export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   let systemPrompt = "You are a helpful assistant.";
   const turns: ParsedTurn[] = [];
@@ -1208,9 +1237,30 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
 
   for (const msg of nonSystem) {
     if (msg.role === "user") {
+      const text = textContent(msg.content);
+      // Coalesce extension-injected context into the preceding real user turn.
+      // pi serializes `custom` context messages as a trailing `user` message
+      // AFTER the real prompt, but Cursor's turn model requires strict
+      // user->assistant alternation — so without this, the injected block would
+      // become the current prompt (userText) and the real prompt would be
+      // demoted into `turns[]` as history. Only messages pi marked with the
+      // <injected-context> sentinel are merged; genuine consecutive user
+      // messages (e.g. an interrupt: "interrupt me" then "continue") are NOT
+      // marked and fall through to the normal last-turn-wins behavior.
+      if (
+        currentTurn &&
+        currentTurn.steps.length === 0 &&
+        isInjectedContext(text)
+      ) {
+        currentTurn.userText = [currentTurn.userText, text]
+          .filter(Boolean)
+          .join("\n\n");
+        currentTurn.images.push(...extractImagesFromContent(msg.content));
+        continue;
+      }
       finalizeCurrentTurn();
       currentTurn = {
-        userText: textContent(msg.content),
+        userText: text,
         images: extractImagesFromContent(msg.content),
         steps: [],
         toolCallById: new Map(),
@@ -1590,6 +1640,7 @@ export function buildCursorRequest(
   checkpoint: Uint8Array | null,
   existingBlobStore?: Map<string, Uint8Array>,
   userImages?: ParsedImage[],
+  summarize = false,
 ): CursorRequestPayload {
   debugLog("cursor_request.build.start", {
     modelId,
@@ -1749,12 +1800,27 @@ export function buildCursorRequest(
   }
 
   const userMessage = createUserMessage(userText, selectedCtxBlob, userImages);
-  const action = create(ConversationActionSchema, {
-    action: {
-      case: "userMessageAction",
-      value: create(UserMessageActionSchema, { userMessage }),
-    },
-  });
+  // When `summarize` is set, send Cursor's native summarizeAction instead of a
+  // user turn. Cursor summarizes the server-side conversation and returns a
+  // reduced ConversationState (verified: ~50-80% usedTokens reduction across
+  // composer/grok/gpt families). This is the working compaction path — unlike
+  // a synthetic checkpoint rebuild, which Cursor's server ignores.
+  const action = summarize
+    ? create(ConversationActionSchema, {
+        action: {
+          case: "summarizeAction",
+          value: create(SummarizeActionSchema, {}),
+        },
+      })
+    : create(ConversationActionSchema, {
+        action: {
+          case: "userMessageAction",
+          value: create(UserMessageActionSchema, { userMessage }),
+        },
+      });
+  if (summarize) {
+    debugLog("cursor_request.summarize_action", { conversationId });
+  }
   const modelDetails = create(ModelDetailsSchema, {
     modelId,
     displayModelId: modelId,
@@ -2202,6 +2268,57 @@ export function deriveConversationKey(
     .update(`conv:${firstUserText.slice(0, 200)}`)
     .digest("hex")
     .slice(0, 16);
+}
+
+/**
+ * Trigger Cursor's native summarizeAction for a session's conversation, in
+ * response to pi's `session_compact`. Uses a loopback request through the proxy
+ * so the full, tested request pipeline (bridge spawn, blob KV handling,
+ * checkpoint capture) is reused instead of duplicated. No-op when there is no
+ * checkpoint yet or no model has been seen for the session. Returns true when
+ * the summarize round-trip completed successfully.
+ */
+export async function summarizeSession(sessionId?: string): Promise<boolean> {
+  if (!sessionId) return false;
+  const convKey = deriveConversationKeyFromSessionId(sessionId);
+  const stored = conversationStates.get(convKey);
+  if (!stored?.checkpoint) {
+    debugLog("summarize.skip_no_checkpoint", { sessionId, convKey });
+    return false;
+  }
+  const modelId = stored.lastModelId;
+  if (!modelId) {
+    debugLog("summarize.skip_no_model", { sessionId, convKey });
+    return false;
+  }
+  const port = getProxyPort();
+  if (!port) {
+    debugLog("summarize.skip_no_port", { sessionId });
+    return false;
+  }
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: modelId,
+        pi_session_id: sessionId,
+        pi_cursor_summarize: true,
+        stream: false,
+        messages: [{ role: "user", content: "summarize" }],
+      }),
+    });
+    // Drain the body so the socket closes and the bridge unrefs cleanly.
+    await res.text().catch(() => "");
+    debugLog("summarize.done", { sessionId, status: res.status });
+    return res.ok;
+  } catch (err) {
+    debugLog("summarize.error", {
+      sessionId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return false;
+  }
 }
 
 export function cleanupSessionState(sessionId?: string): void {
