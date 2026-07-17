@@ -6,6 +6,7 @@ import {
   buildEffortMap,
   FALLBACK_MODELS,
   parseModelId,
+  modelConfig,
   processModels,
   registerSessionLifecycleCleanup,
   supportsReasoningModelId,
@@ -330,6 +331,28 @@ describe("reasoning support", () => {
     expect(
       FALLBACK_MODELS.find((model) => model.id === "composer-2")?.reasoning,
     ).toBe(true);
+  });
+});
+
+describe("modelConfig", () => {
+  test("cursor-grok-4.5 — effort-deduped model advertises reasoning despite vendor prefix", () => {
+    const result = processModels([
+      m("cursor-grok-4.5-low"),
+      m("cursor-grok-4.5-medium"),
+      m("cursor-grok-4.5-high"),
+    ]);
+    expect(result).toHaveLength(1);
+    expect(result[0]!.id).toBe("cursor-grok-4.5");
+    expect(result[0]!.supportsEffort).toBe(true);
+    const config = modelConfig(result[0]!);
+    expect(config.reasoning).toBe(true);
+    expect(config.compat.supportsReasoningEffort).toBe(true);
+  });
+
+  test("non-effort unknown model stays non-reasoning", () => {
+    const result = processModels([m("totally-unknown-model")]);
+    const config = modelConfig(result[0]!);
+    expect(config.reasoning).toBe(false);
   });
 });
 

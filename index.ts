@@ -491,11 +491,11 @@ export function processModels(raw: CursorModel[]): ProcessedModel[] {
   return result.sort((a, b) => a.id.localeCompare(b.id));
 }
 
-function modelConfig(m: ProcessedModel) {
+export function modelConfig(m: ProcessedModel) {
   return {
     id: m.id,
     name: m.name,
-    reasoning: supportsReasoningModelId(m.id),
+    reasoning: m.supportsEffort || supportsReasoningModelId(m.id),
     input: ["text", "image"] as ("text" | "image")[],
     cost: estimateModelCost(m.id),
     contextWindow: inferContextWindow(m.id),
