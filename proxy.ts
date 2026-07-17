@@ -971,6 +971,69 @@ export function resolveModelId(
   return `${base}-${reasoningEffort}${suffix}`;
 }
 
+/**
+ * Effort suffixes to try, cheapest first, when flooring a mandatory-effort
+ * model that was requested without an effort (e.g. Grok with pi thinking OFF).
+ * Pool attribution is per-model-family, not per-effort, so the cheapest valid
+ * variant is the correct floor.
+ */
+const FLOOR_EFFORT_ORDER = [
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "none",
+] as const;
+
+/**
+ * Resolve the model id actually sent to Cursor, validated against the set of
+ * ids Cursor advertises via GetUsableModels.
+ *
+ * Some models (e.g. `cursor-grok-4.5`) are only advertised with a mandatory
+ * effort suffix (`-low/-medium/-high`) — there is no bare variant. Pi collapses
+ * those into a single picker id and, when thinking is OFF, sends no
+ * `reasoning_effort`, so `resolveModelId` returns the bare id. That bare id is
+ * NOT a real usable model, and Cursor mis-attributes it to the API usage pool
+ * instead of the First-party pool.
+ *
+ * This guard floors such requests to the cheapest advertised effort variant of
+ * the same base (preserving `-fast`/`-thinking`). Ids that are already usable
+ * (e.g. `composer-2.5`, or an effort was supplied) pass through untouched.
+ */
+export function resolveUsableModelId(
+  model: string,
+  reasoningEffort: string | undefined,
+  usableIds: ReadonlySet<string>,
+): { modelId: string; floored: boolean; warn?: string } {
+  const candidate = resolveModelId(model, reasoningEffort);
+  // No usable set to validate against, or the candidate is already advertised.
+  if (usableIds.size === 0 || usableIds.has(candidate)) {
+    return { modelId: candidate, floored: false };
+  }
+  // Candidate is not advertised: floor to a real effort variant of the same
+  // base (+fast/+thinking). Covers mandatory-effort models selected with
+  // thinking OFF (no reasoning_effort sent).
+  for (const eff of FLOOR_EFFORT_ORDER) {
+    const floored = resolveModelId(model, eff);
+    if (usableIds.has(floored)) {
+      return { modelId: floored, floored: true };
+    }
+  }
+  // No real variant found — send the candidate unchanged but flag the drift.
+  return {
+    modelId: candidate,
+    floored: false,
+    warn: `resolved modelId "${candidate}" is not in Cursor's usable-model set`,
+  };
+}
+
+/** Real, Cursor-advertised usable model ids (effort-suffixed), from cache. */
+function getKnownUsableModelIds(): Set<string> {
+  const models = cachedModels ?? loadCachedModels() ?? [];
+  return new Set(models.map((m) => m.id));
+}
+
 async function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
@@ -980,7 +1043,30 @@ async function handleChatCompletion(
 ): Promise<void> {
   const { systemPrompt, userText, userImages, turns, toolResults } =
     parseMessages(body.messages);
-  const modelId = resolveModelId(body.model, body.reasoning_effort);
+  const usableModelIds = getKnownUsableModelIds();
+  const resolvedModel = resolveUsableModelId(
+    body.model,
+    body.reasoning_effort,
+    usableModelIds,
+  );
+  const modelId = resolvedModel.modelId;
+  if (resolvedModel.floored) {
+    debugLog("chat.model_floored", {
+      requestId,
+      model: body.model,
+      reasoningEffort: body.reasoning_effort,
+      resolvedModelId: modelId,
+    });
+  }
+  if (resolvedModel.warn) {
+    debugLog("chat.non_usable_model", {
+      requestId,
+      model: body.model,
+      resolvedModelId: modelId,
+      warn: resolvedModel.warn,
+    });
+    console.warn(`[cursor-provider] ${resolvedModel.warn}`);
+  }
   const tools = body.tools ?? [];
 
   debugLog("chat.parsed_messages", {

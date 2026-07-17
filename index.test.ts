@@ -12,6 +12,7 @@ import {
 } from "./index.ts";
 import {
   resolveModelId,
+  resolveUsableModelId,
   __testInternals,
   cleanupAllSessionState,
   cleanupSessionState,
@@ -584,6 +585,62 @@ describe("resolveModelId", () => {
     expect(resolveModelId("gpt-5.3-codex-spark-preview", "xhigh")).toBe(
       "gpt-5.3-codex-spark-preview-xhigh",
     );
+  });
+});
+
+// ── resolveUsableModelId (First-party billing guard) ──
+
+describe("resolveUsableModelId", () => {
+  // Mirrors what Cursor advertises via GetUsableModels: grok is mandatory-effort
+  // (no bare id), composer has a bare usable id.
+  const usable = new Set([
+    "cursor-grok-4.5-low",
+    "cursor-grok-4.5-medium",
+    "cursor-grok-4.5-high",
+    "cursor-grok-4.5-low-fast",
+    "cursor-grok-4.5-medium-fast",
+    "cursor-grok-4.5-high-fast",
+    "composer-2.5",
+    "composer-2.5-fast",
+  ]);
+
+  test("grok thinking OFF (no effort) floors to cheapest usable variant", () => {
+    const r = resolveUsableModelId("cursor-grok-4.5", undefined, usable);
+    expect(r.modelId).toBe("cursor-grok-4.5-low");
+    expect(r.floored).toBe(true);
+    expect(r.warn).toBeUndefined();
+  });
+
+  test("grok -fast thinking OFF floors before the -fast suffix", () => {
+    const r = resolveUsableModelId("cursor-grok-4.5-fast", undefined, usable);
+    expect(r.modelId).toBe("cursor-grok-4.5-low-fast");
+    expect(r.floored).toBe(true);
+  });
+
+  test("grok with an explicit effort passes through untouched", () => {
+    const r = resolveUsableModelId("cursor-grok-4.5", "medium", usable);
+    expect(r.modelId).toBe("cursor-grok-4.5-medium");
+    expect(r.floored).toBe(false);
+  });
+
+  test("composer-2.5 has a bare usable id — stays bare on thinking OFF", () => {
+    const r = resolveUsableModelId("composer-2.5", undefined, usable);
+    expect(r.modelId).toBe("composer-2.5");
+    expect(r.floored).toBe(false);
+    expect(r.warn).toBeUndefined();
+  });
+
+  test("empty usable set is a no-op (degrade to legacy behavior)", () => {
+    const r = resolveUsableModelId("cursor-grok-4.5", undefined, new Set());
+    expect(r.modelId).toBe("cursor-grok-4.5");
+    expect(r.floored).toBe(false);
+  });
+
+  test("unknown model with no usable variant is returned with a warning", () => {
+    const r = resolveUsableModelId("made-up-model", undefined, usable);
+    expect(r.modelId).toBe("made-up-model");
+    expect(r.floored).toBe(false);
+    expect(r.warn).toContain("not in Cursor's usable-model set");
   });
 });
 
