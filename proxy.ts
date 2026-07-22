@@ -86,6 +86,7 @@ import {
   WriteShellStdinErrorSchema,
   WriteShellStdinResultSchema,
   ConversationSummaryArchiveSchema,
+  ConversationSummarySchema,
   GetUsableModelsRequestSchema,
   GetUsableModelsResponseSchema,
   type AgentServerMessage,
@@ -2405,6 +2406,113 @@ export async function summarizeSession(sessionId?: string): Promise<boolean> {
     });
     return false;
   }
+}
+
+export interface NativeCompactionResult {
+  /** True when the summarize round-trip completed successfully. */
+  ok: boolean;
+  /** True when Cursor's server checkpoint actually changed (mutation happened). */
+  mutated: boolean;
+  /**
+   * The faithful, cumulative, identifier-exact summary text from the checkpoint's
+   * top-level `ConversationStateStructure.summary` (field 6, populated by the
+   * summary action). Falls back to the newest `summaryArchives` entry only if
+   * field 6 is absent. Undefined when neither is decodable.
+   */
+  summary?: string;
+  /** usedTokens before/after, for diagnostics. */
+  tokensBefore?: number;
+  tokensAfter?: number;
+}
+
+function decodeCheckpointSummary(
+  stored: StoredConversation | undefined,
+): string | undefined {
+  if (!stored?.checkpoint) return undefined;
+  let state: ConversationStateStructure;
+  try {
+    state = fromBinary(ConversationStateStructureSchema, stored.checkpoint);
+  } catch {
+    return undefined;
+  }
+  // Primary: top-level field-6 summary (cumulative, code-faithful).
+  if (state.summary?.length) {
+    const data = stored.blobStore.get(Buffer.from(state.summary).toString("hex"));
+    if (data) {
+      try {
+        const decoded = fromBinary(ConversationSummarySchema, data).summary;
+        if (decoded && decoded.trim()) return decoded;
+      } catch {
+        // fall through to archive fallback
+      }
+    }
+  }
+  // Fallback: newest summary archive (generalized/lossy, last resort only).
+  for (let i = state.summaryArchives.length - 1; i >= 0; i--) {
+    const data = stored.blobStore.get(
+      Buffer.from(state.summaryArchives[i]!).toString("hex"),
+    );
+    if (!data) continue;
+    try {
+      const decoded = fromBinary(ConversationSummaryArchiveSchema, data).summary;
+      if (decoded && decoded.trim()) return decoded;
+    } catch {
+      // try older archive
+    }
+  }
+  return undefined;
+}
+
+function checkpointUsedTokens(
+  stored: StoredConversation | undefined,
+): number | undefined {
+  if (!stored?.checkpoint) return undefined;
+  try {
+    const state = fromBinary(ConversationStateStructureSchema, stored.checkpoint);
+    return state.tokenDetails?.usedTokens;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Run Cursor's native `summarizeAction` and extract the resulting durable
+ * summary text so a `session_before_compact` handler can hand it to pi as an
+ * extension-supplied CompactionResult. Distinguishes total failure (no
+ * checkpoint mutation) from partial success (mutated but no decodable summary)
+ * so the caller can decide whether to cancel.
+ */
+export async function summarizeSessionAndGetSummary(
+  sessionId?: string,
+): Promise<NativeCompactionResult> {
+  if (!sessionId) return { ok: false, mutated: false };
+  const convKey = deriveConversationKeyFromSessionId(sessionId);
+  const before = conversationStates.get(convKey);
+  const beforeHex = before?.checkpoint
+    ? Buffer.from(before.checkpoint).toString("hex")
+    : null;
+  const tokensBefore = checkpointUsedTokens(before);
+  const ok = await summarizeSession(sessionId);
+  const after = conversationStates.get(convKey);
+  const afterHex = after?.checkpoint
+    ? Buffer.from(after.checkpoint).toString("hex")
+    : null;
+  const mutated = beforeHex !== afterHex;
+  const tokensAfter = checkpointUsedTokens(after);
+  if (!ok) {
+    debugLog("summarize_extract.failed", { sessionId, mutated });
+    return { ok: false, mutated, tokensBefore, tokensAfter };
+  }
+  const summary = decodeCheckpointSummary(after);
+  debugLog("summarize_extract.done", {
+    sessionId,
+    mutated,
+    hasSummary: !!summary,
+    summaryLength: summary?.length ?? 0,
+    tokensBefore,
+    tokensAfter,
+  });
+  return { ok: true, mutated, summary, tokensBefore, tokensAfter };
 }
 
 export function cleanupSessionState(sessionId?: string): void {

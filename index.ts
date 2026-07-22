@@ -33,7 +33,7 @@ import {
   inferContextWindow,
   loadCachedModels,
   startProxy,
-  summarizeSession,
+  summarizeSessionAndGetSummary,
   type CursorModel,
 } from "./proxy.js";
 
@@ -540,27 +540,156 @@ export function registerSessionLifecycleCleanup(pi: ExtensionAPI): void {
   pi.on("session_before_tree", cleanupCurrentSession);
   pi.on("session_shutdown", cleanupCurrentSession);
 
-  // After pi compacts (manual /compact or auto), trigger Cursor's native
-  // summarizeAction so the SERVER-SIDE conversation is actually compacted.
-  // Verified to cut usedTokens ~50-80% across composer/grok/gpt cursor models.
+  // Cursor compaction is server-authoritative. On `session_before_compact` we
+  // run Cursor's native `summarizeAction` (verified to cut usedTokens ~50-80%),
+  // then hand pi the resulting durable summary as an extension-supplied
+  // CompactionResult. pi records a normal compaction entry WITHOUT running its
+  // own summarizer — eliminating the old dual-compaction + continuation race
+  // that ran summarizeAction on `session_compact` after pi had already
+  // committed its own summary.
   //
-  // Note: clearing/rebuilding the checkpoint does NOT work — Cursor's server
-  // ignores a synthetic conversation state. summarizeAction mutates Cursor's
-  // own authoritative state, so the reduction sticks and the checkpoint we
-  // capture from the response stays valid for subsequent turns.
-  pi.on("session_compact", async (_event, ctx) => {
+  // Non-Cursor providers: return undefined so pi uses its default summarizer.
+  //
+  // Failure policy: never fall through to pi's summarizer for Cursor (a
+  // summarization inference through the stateful proxy would pollute the live
+  // checkpoint). On any native failure we cancel; the auto-compaction
+  // circuit breaker is the loop backstop.
+  pi.on("session_before_compact", async (event, ctx) => {
+    if (ctx.model?.provider !== "cursor") return undefined;
     const sessionId = ctx.sessionManager.getSessionId();
-    debugExtensionLog("session.compact_summarize", { sessionId });
+    const preparation = (event as { preparation?: CompactionPreparationShape })
+      .preparation;
+    const customInstructions = (
+      event as { customInstructions?: string }
+    ).customInstructions?.trim();
+    const reason = (event as { reason?: string }).reason;
+    debugExtensionLog("session.before_compact", {
+      sessionId,
+      reason,
+      hasCustomInstructions: !!customInstructions,
+    });
+
+    // Cursor's SummarizeAction protobuf has no custom-instructions field, so we
+    // cannot honor `/compact <instructions>`. Refuse rather than silently
+    // ignore. Only reachable from manual /compact (threshold/overflow never
+    // set customInstructions).
+    if (customInstructions) {
+      if (ctx.hasUI) {
+        ctx.ui.notify(
+          "Cursor native compaction does not support custom /compact instructions; compaction skipped.",
+          "warning",
+        );
+      }
+      return { cancel: true };
+    }
+
+    if (!preparation?.firstKeptEntryId) {
+      debugExtensionLog("session.before_compact_no_preparation", { sessionId });
+      return { cancel: true };
+    }
+
     try {
-      const ok = await summarizeSession(sessionId);
-      debugExtensionLog("session.compact_summarize_done", { sessionId, ok });
+      const result = await summarizeSessionAndGetSummary(sessionId);
+      if (!result.ok || !result.summary) {
+        debugExtensionLog("session.before_compact_native_failed", {
+          sessionId,
+          ok: result.ok,
+          mutated: result.mutated,
+          hasSummary: !!result.summary,
+        });
+        if (ctx.hasUI) {
+          ctx.ui.notify(
+            result.mutated
+              ? "Cursor native compaction returned no usable summary; compaction skipped."
+              : "Cursor native compaction failed; compaction skipped.",
+            "warning",
+          );
+        }
+        return { cancel: true };
+      }
+      const summary = result.summary + buildFileOpsFooter(preparation);
+      debugExtensionLog("session.before_compact_done", {
+        sessionId,
+        summaryLength: summary.length,
+        firstKeptEntryId: preparation.firstKeptEntryId,
+        tokensBefore: preparation.tokensBefore,
+        tokensAfter: result.tokensAfter,
+      });
+      return {
+        compaction: {
+          summary,
+          firstKeptEntryId: preparation.firstKeptEntryId,
+          tokensBefore: preparation.tokensBefore,
+          details: buildCompactionDetails(preparation),
+        },
+      };
     } catch (err) {
-      debugExtensionLog("session.compact_summarize_error", {
+      debugExtensionLog("session.before_compact_error", {
         sessionId,
         error: err instanceof Error ? err.message : String(err),
       });
+      if (ctx.hasUI) {
+        ctx.ui.notify(
+          `Cursor native compaction error: ${err instanceof Error ? err.message : String(err)}; compaction skipped.`,
+          "warning",
+        );
+      }
+      return { cancel: true };
     }
   });
+}
+
+/** Minimal shape of pi's CompactionPreparation we consume. */
+interface CompactionPreparationShape {
+  firstKeptEntryId: string;
+  tokensBefore: number;
+  fileOps?: {
+    read?: Set<string> | string[];
+    written?: Set<string> | string[];
+    edited?: Set<string> | string[];
+  };
+}
+
+function toArray(value: Set<string> | string[] | undefined): string[] {
+  if (!value) return [];
+  return Array.isArray(value) ? value : Array.from(value);
+}
+
+/** readFiles = read-only files; modifiedFiles = written ∪ edited. */
+function computeFileLists(prep: CompactionPreparationShape): {
+  readFiles: string[];
+  modifiedFiles: string[];
+} {
+  const read = new Set(toArray(prep.fileOps?.read));
+  const written = toArray(prep.fileOps?.written);
+  const edited = toArray(prep.fileOps?.edited);
+  const modified = new Set([...written, ...edited]);
+  for (const f of modified) read.delete(f);
+  return { readFiles: [...read], modifiedFiles: [...modified] };
+}
+
+function buildCompactionDetails(prep: CompactionPreparationShape): {
+  readFiles: string[];
+  modifiedFiles: string[];
+} {
+  return computeFileLists(prep);
+}
+
+/** Append pi's standard file-operation footer so the stored summary matches
+ *  the shape pi's own summarizer produces. */
+function buildFileOpsFooter(prep: CompactionPreparationShape): string {
+  const { readFiles, modifiedFiles } = computeFileLists(prep);
+  if (readFiles.length === 0 && modifiedFiles.length === 0) return "";
+  const parts: string[] = ["\n"];
+  if (readFiles.length > 0) {
+    parts.push(`<files_read>\n${readFiles.join("\n")}\n</files_read>`);
+  }
+  if (modifiedFiles.length > 0) {
+    parts.push(
+      `<files_modified>\n${modifiedFiles.join("\n")}\n</files_modified>`,
+    );
+  }
+  return parts.join("\n");
 }
 
 function registerExtensionDebugHooks(pi: ExtensionAPI) {
