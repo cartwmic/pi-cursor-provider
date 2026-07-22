@@ -57,6 +57,7 @@ import {
   ConversationActionSchema,
   ConversationStateStructureSchema,
   ConversationSummarySchema,
+  ConversationSummaryArchiveSchema,
   ConversationTokenDetailsSchema,
   ConversationTurnStructureSchema,
   ConversationStepSchema,
@@ -2625,11 +2626,19 @@ describe("summarizeSessionAndGetSummary — fresh-summary gate (F2)", () => {
       blobStore: new Map(),
       lastModelId: "gpt-5",
     });
+    // Install a REAL, decodable archive blob so this would decode to
+    // "ARCHIVE B" (=> summaryChanged true) under the old archive-fallback
+    // behaviour. Field-6-only decoding must ignore it.
+    const archiveId = new Uint8Array([0xab, 0xcd, 0xef, 0x01]);
+    const archiveBlob = toBinary(
+      ConversationSummaryArchiveSchema,
+      create(ConversationSummaryArchiveSchema, { summary: "ARCHIVE B" }),
+    );
     const archiveMsg = create(AgentServerMessageSchema, {
       message: {
         case: "conversationCheckpointUpdate",
         value: create(ConversationStateStructureSchema, {
-          summaryArchives: [new Uint8Array([0xab, 0xcd])],
+          summaryArchives: [archiveId],
           tokenDetails: create(ConversationTokenDetailsSchema, { usedTokens: 60 }),
         }),
       },
@@ -2638,6 +2647,7 @@ describe("summarizeSessionAndGetSummary — fresh-summary gate (F2)", () => {
       (options) =>
         new FakeBridge(options, (clientMessage, fake) => {
           if (clientMessage.message.case === "runRequest") {
+            fake.emitServerMessage(makeSetBlobMessage(archiveId, archiveBlob));
             fake.emitServerMessage(archiveMsg);
             fake.close(0);
           }
@@ -2647,7 +2657,8 @@ describe("summarizeSessionAndGetSummary — fresh-summary gate (F2)", () => {
     const res = await summarizeSessionAndGetSummary(sessionId);
     expect(res.ok).toBe(true);
     expect(res.mutated).toBe(true); // archives + tokens changed
-    expect(res.summaryChanged).toBe(false); // but no field-6 summary => reject
+    // Decodable archive present, but field-6-only decoding ignores it:
+    expect(res.summaryChanged).toBe(false);
     expect(res.summary).toBeUndefined(); // archives are never used as the summary
   });
 });
