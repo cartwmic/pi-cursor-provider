@@ -2712,10 +2712,13 @@ export interface NativeCompactionResult {
    */
   summaryChanged: boolean;
   /**
-   * The faithful, cumulative, identifier-exact summary text from the checkpoint's
-   * top-level `ConversationStateStructure.summary` (field 6, populated by the
-   * summary action). Falls back to the newest `summaryArchives` entry only if
-   * field 6 is absent. Undefined when neither is decodable.
+   * The faithful, cumulative, identifier-exact summary text from the
+   * checkpoint's top-level `ConversationStateStructure.summary` (field 6),
+   * which is what Cursor's summary action populates. Undefined when field 6 is
+   * absent/undecodable. The lossy `summaryArchives` (incremental turn-folding
+   * done by buildCursorRequest, unrelated to summarizeAction) are deliberately
+   * NOT used here: committing an archive as a pi compaction summary against a
+   * new firstKeptEntryId would silently drop history.
    */
   summary?: string;
   /** usedTokens before/after, for diagnostics. */
@@ -2723,6 +2726,8 @@ export interface NativeCompactionResult {
   tokensAfter?: number;
 }
 
+// Decode ONLY the top-level field-6 summary (what summarizeAction populates).
+// summaryArchives are intentionally ignored — see NativeCompactionResult.summary.
 function decodeCheckpointSummary(
   stored: StoredConversation | undefined,
 ): string | undefined {
@@ -2733,30 +2738,14 @@ function decodeCheckpointSummary(
   } catch {
     return undefined;
   }
-  // Primary: top-level field-6 summary (cumulative, code-faithful).
-  if (state.summary?.length) {
-    const data = stored.blobStore.get(Buffer.from(state.summary).toString("hex"));
-    if (data) {
-      try {
-        const decoded = fromBinary(ConversationSummarySchema, data).summary;
-        if (decoded && decoded.trim()) return decoded;
-      } catch {
-        // fall through to archive fallback
-      }
-    }
-  }
-  // Fallback: newest summary archive (generalized/lossy, last resort only).
-  for (let i = state.summaryArchives.length - 1; i >= 0; i--) {
-    const data = stored.blobStore.get(
-      Buffer.from(state.summaryArchives[i]!).toString("hex"),
-    );
-    if (!data) continue;
-    try {
-      const decoded = fromBinary(ConversationSummaryArchiveSchema, data).summary;
-      if (decoded && decoded.trim()) return decoded;
-    } catch {
-      // try older archive
-    }
+  if (!state.summary?.length) return undefined;
+  const data = stored.blobStore.get(Buffer.from(state.summary).toString("hex"));
+  if (!data) return undefined;
+  try {
+    const decoded = fromBinary(ConversationSummarySchema, data).summary;
+    if (decoded && decoded.trim()) return decoded;
+  } catch {
+    return undefined;
   }
   return undefined;
 }

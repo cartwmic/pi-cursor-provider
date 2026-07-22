@@ -2605,6 +2605,196 @@ describe("summarizeSessionAndGetSummary — fresh-summary gate (F2)", () => {
     expect(res.summaryChanged).toBe(false); // but no fresh summary => reject
     expect(res.summary).toBe("OLD SUMMARY"); // decodes the stale one
   });
+
+  test("R3-F2-1: an archive-only mutation (no field-6 summary) is NOT fresh", async () => {
+    // buildCursorRequest folds old turns into lossy summaryArchives. A summarize
+    // round-trip that grows archives but never populates field 6 must not be
+    // accepted as a native compaction — archives are lossy and would drop
+    // history. Seed with NO field-6 summary; respond with a new archive + no
+    // field 6 + changed tokens.
+    const sessionId = "f2-archive-only";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv-arch",
+      checkpoint: toBinary(
+        ConversationStateStructureSchema,
+        create(ConversationStateStructureSchema, {
+          tokenDetails: create(ConversationTokenDetailsSchema, { usedTokens: 100 }),
+        }),
+      ),
+      blobStore: new Map(),
+      lastModelId: "gpt-5",
+    });
+    const archiveMsg = create(AgentServerMessageSchema, {
+      message: {
+        case: "conversationCheckpointUpdate",
+        value: create(ConversationStateStructureSchema, {
+          summaryArchives: [new Uint8Array([0xab, 0xcd])],
+          tokenDetails: create(ConversationTokenDetailsSchema, { usedTokens: 60 }),
+        }),
+      },
+    });
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            fake.emitServerMessage(archiveMsg);
+            fake.close(0);
+          }
+        }),
+    );
+    await startProxy(async () => "test-token");
+    const res = await summarizeSessionAndGetSummary(sessionId);
+    expect(res.ok).toBe(true);
+    expect(res.mutated).toBe(true); // archives + tokens changed
+    expect(res.summaryChanged).toBe(false); // but no field-6 summary => reject
+    expect(res.summary).toBeUndefined(); // archives are never used as the summary
+  });
+});
+
+describe("session_before_compact handler (native compaction gate)", () => {
+  let stateDir: string;
+  let prevStateDir: string | undefined;
+  beforeEach(() => {
+    prevStateDir = process.env.PI_CURSOR_PROVIDER_STATE_DIR;
+    stateDir = mkdtempSync(join(tmpdir(), "cursor-hdlr-"));
+    process.env.PI_CURSOR_PROVIDER_STATE_DIR = stateDir;
+  });
+  afterEach(() => {
+    if (prevStateDir === undefined) delete process.env.PI_CURSOR_PROVIDER_STATE_DIR;
+    else process.env.PI_CURSOR_PROVIDER_STATE_DIR = prevStateDir;
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  const S1 = new Uint8Array([0x31, 0x31, 0x31, 0x31]);
+  const S2 = new Uint8Array([0x32, 0x32, 0x32, 0x32]);
+  const summaryBlob = (t: string) =>
+    toBinary(ConversationSummarySchema, create(ConversationSummarySchema, { summary: t }));
+  const cpBytes = (summaryId: Uint8Array, usedTokens: number) =>
+    toBinary(
+      ConversationStateStructureSchema,
+      create(ConversationStateStructureSchema, {
+        summary: summaryId,
+        tokenDetails: create(ConversationTokenDetailsSchema, { usedTokens }),
+      }),
+    );
+  const cpMsg = (summaryId: Uint8Array, usedTokens: number) =>
+    create(AgentServerMessageSchema, {
+      message: {
+        case: "conversationCheckpointUpdate",
+        value: create(ConversationStateStructureSchema, {
+          summary: summaryId,
+          tokenDetails: create(ConversationTokenDetailsSchema, { usedTokens }),
+        }),
+      },
+    });
+
+  function getHandler() {
+    const handlers = new Map<string, Function>();
+    registerSessionLifecycleCleanup({
+      on: (e: string, h: Function) => handlers.set(e, h),
+    } as any);
+    return handlers.get("session_before_compact")!;
+  }
+  function makeCtx(sessionId: string, notes: string[]) {
+    return {
+      model: { provider: "cursor" },
+      hasUI: true,
+      ui: { notify: (m: string) => notes.push(m) },
+      sessionManager: { getSessionId: () => sessionId, getLeafId: () => "leaf-1" },
+    };
+  }
+  function seed(sessionId: string) {
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv-h",
+      checkpoint: cpBytes(S1, 100),
+      blobStore: new Map<string, Uint8Array>([
+        [Buffer.from(S1).toString("hex"), summaryBlob("OLD SUMMARY")],
+      ]),
+      lastModelId: "gpt-5",
+    });
+    return convKey;
+  }
+
+  test("commits a compaction when a fresh field-6 summary is produced", async () => {
+    const sessionId = "h-fresh";
+    seed(sessionId);
+    setBridgeFactoryForTests(
+      (o) =>
+        new FakeBridge(o, (m, fake) => {
+          if (m.message.case === "runRequest") {
+            fake.emitServerMessage(makeSetBlobMessage(S2, summaryBlob("NEW SUMMARY")));
+            fake.emitServerMessage(cpMsg(S2, 40));
+            fake.close(0);
+          }
+        }),
+    );
+    await startProxy(async () => "test-token");
+    const notes: string[] = [];
+    const result = await getHandler()(
+      { preparation: { firstKeptEntryId: "keep-1", tokensBefore: 100 } },
+      makeCtx(sessionId, notes),
+    );
+    expect(result?.compaction?.summary).toContain("NEW SUMMARY");
+    expect(result?.compaction?.firstKeptEntryId).toBe("keep-1");
+    expect(result?.cancel).toBeUndefined();
+    expect(notes).toEqual([]);
+  });
+
+  test("cancels + invalidates when the checkpoint mutates without a fresh summary", async () => {
+    const sessionId = "h-stale";
+    const convKey = seed(sessionId);
+    setBridgeFactoryForTests(
+      (o) =>
+        new FakeBridge(o, (m, fake) => {
+          if (m.message.case === "runRequest") {
+            fake.emitServerMessage(cpMsg(S1, 90)); // same summary, new tokens
+            fake.close(0);
+          }
+        }),
+    );
+    await startProxy(async () => "test-token");
+    const notes: string[] = [];
+    const result = await getHandler()(
+      { preparation: { firstKeptEntryId: "keep-1", tokensBefore: 100 } },
+      makeCtx(sessionId, notes),
+    );
+    expect(result?.cancel).toBe(true);
+    expect(result?.compaction).toBeUndefined();
+    // mutated-without-fresh-summary => in-memory state dropped for clean rebuild.
+    expect(__testInternals.conversationStates.has(convKey)).toBe(false);
+    expect(notes[0]).toContain("did not produce a new summary");
+  });
+
+  test("refuses custom /compact instructions (no protocol field for them)", async () => {
+    const sessionId = "h-custom";
+    seed(sessionId);
+    const notes: string[] = [];
+    const result = await getHandler()(
+      {
+        preparation: { firstKeptEntryId: "keep-1", tokensBefore: 100 },
+        customInstructions: "focus on the auth module",
+      },
+      makeCtx(sessionId, notes),
+    );
+    expect(result?.cancel).toBe(true);
+    expect(notes[0]).toContain("custom /compact instructions");
+  });
+
+  test("defers to pi's summarizer for non-cursor providers", async () => {
+    const sessionId = "h-noncursor";
+    const notes: string[] = [];
+    const ctx = {
+      ...makeCtx(sessionId, notes),
+      model: { provider: "anthropic" },
+    };
+    const result = await getHandler()(
+      { preparation: { firstKeptEntryId: "keep-1", tokensBefore: 100 } },
+      ctx,
+    );
+    expect(result).toBeUndefined();
+  });
 });
 
 describe("durable conversation-state persistence (resume across process)", () => {
