@@ -992,7 +992,7 @@ describe("buildCursorRequest — turn reconstruction", () => {
     expect(userAction.userMessage.text).toBe("hello");
   });
 
-  test("no checkpoint, with assistant-text turns — reconstructs protobuf turns without inline fallback", () => {
+  test("no checkpoint, with turns — inlines full transcript into the message, empty state turns", () => {
     const turns = [
       turn("first question", [assistantStep("first answer")]),
       turn("second question", [assistantStep("second answer")]),
@@ -1007,28 +1007,20 @@ describe("buildCursorRequest — turn reconstruction", () => {
     );
     const req = decodeRunRequest(payload);
 
-    const decoded = decodeTurns(req.conversationState, payload.blobStore);
-    expect(decoded).toHaveLength(2);
-
-    expect(decoded[0]!.userMsg.text).toBe("first question");
-    expect(decoded[0]!.steps).toHaveLength(1);
-    expect(decoded[0]!.steps[0]!.message.case).toBe("assistantMessage");
-    expect((decoded[0]!.steps[0]!.message.value as any).text).toBe(
-      "first answer",
-    );
-
-    expect(decoded[1]!.userMsg.text).toBe("second question");
-    expect(decoded[1]!.steps[0]!.message.case).toBe("assistantMessage");
-    expect((decoded[1]!.steps[0]!.message.value as any).text).toBe(
-      "second answer",
-    );
-
-    const userAction = req.action.action.value as any;
-    expect(userAction.userMessage.text).toBe("third question");
-    expect(userAction.userMessage.text).not.toContain("<conversation_history>");
+    // Cursor ignores client-reconstructed state, so no structured turns are
+    // sent; the history rides inline in the live user message instead.
+    expect(req.conversationState.turns).toHaveLength(0);
+    const text = (req.action.action.value as any).userMessage.text as string;
+    expect(text).toContain("[Earlier conversation");
+    expect(text).toContain("first question");
+    expect(text).toContain("first answer");
+    expect(text).toContain("second question");
+    expect(text).toContain("second answer");
+    // The latest user message is last.
+    expect(text.endsWith("third question")).toBe(true);
   });
 
-  test("no checkpoint, reconstructs tool-call steps and final assistant text", () => {
+  test("no checkpoint, inlines tool-call steps and final assistant text", () => {
     const turns = [
       turn("inspect file", [
         toolStep(
@@ -1049,33 +1041,16 @@ describe("buildCursorRequest — turn reconstruction", () => {
       null,
     );
     const req = decodeRunRequest(payload);
-    const decoded = decodeTurns(req.conversationState, payload.blobStore);
-
-    expect(decoded).toHaveLength(1);
-    expect(decoded[0]!.userMsg.text).toBe("inspect file");
-    expect(decoded[0]!.steps).toHaveLength(2);
-
-    const toolCallStep = decoded[0]!.steps[0]!;
-    const toolCallValue = toolCallStep.message.value as any;
-    expect(toolCallStep.message.case).toBe("toolCall");
-    expect(toolCallValue.tool.case).toBe("mcpToolCall");
-    expect(toolCallValue.tool.value.args?.toolCallId).toBe("tc1");
-    expect(toolCallValue.tool.value.args?.toolName).toBe("read");
-    expect(toolCallValue.tool.value.result?.result.case).toBe("success");
-    expect(toolCallValue.tool.value.result?.result.value.content[0]?.content.case).toBe("text");
-    expect(toolCallValue.tool.value.result?.result.value.content[0]?.content.value.text).toBe("file contents");
-
-    const finalAssistantStep = decoded[0]!.steps[1]!;
-    expect(finalAssistantStep.message.case).toBe("assistantMessage");
-    expect((finalAssistantStep.message.value as any).text).toBe(
-      "I found the issue.",
-    );
-
-    const userAction = req.action.action.value as any;
-    expect(userAction.userMessage.text).toBe("fix it");
+    expect(req.conversationState.turns).toHaveLength(0);
+    const text = (req.action.action.value as any).userMessage.text as string;
+    expect(text).toContain("inspect file");
+    expect(text).toContain("read");
+    expect(text).toContain("file contents");
+    expect(text).toContain("I found the issue.");
+    expect(text.endsWith("fix it")).toBe(true);
   });
 
-  test("no checkpoint, turn with no steps — no reconstructed steps", () => {
+  test("no checkpoint, inlines a stepless turn", () => {
     const turns = [turn("hello")];
     const payload = buildCursorRequest(
       "gpt-5",
@@ -1086,10 +1061,10 @@ describe("buildCursorRequest — turn reconstruction", () => {
       null,
     );
     const req = decodeRunRequest(payload);
-    const decoded = decodeTurns(req.conversationState, payload.blobStore);
-    expect(decoded).toHaveLength(1);
-    expect(decoded[0]!.userMsg.text).toBe("hello");
-    expect(decoded[0]!.steps).toHaveLength(0);
+    expect(req.conversationState.turns).toHaveLength(0);
+    const text = (req.action.action.value as any).userMessage.text as string;
+    expect(text).toContain("hello");
+    expect(text.endsWith("follow up")).toBe(true);
   });
 
   test("with checkpoint — uses checkpoint, ignores turns", () => {
@@ -1145,29 +1120,30 @@ describe("buildCursorRequest — turn reconstruction", () => {
     expect(blobData.content).toBe("You are helpful");
   });
 
-  test("each reconstructed turn has a unique messageId", () => {
-    const turns = [
-      turn("a", [assistantStep("b")]),
-      turn("a", [assistantStep("b")]),
-    ];
+  test("no checkpoint, inlined transcript is NOT truncated (totality)", () => {
+    const longUser = "U".repeat(4000);
+    const longAssistant = "A".repeat(4000);
+    const turns = [turn(longUser, [assistantStep(longAssistant)])];
     const payload = buildCursorRequest(
       "gpt-5",
       "system",
-      "c",
+      "next",
       turns,
       "conv-1",
       null,
     );
     const req = decodeRunRequest(payload);
-    const decoded = decodeTurns(req.conversationState, payload.blobStore);
-    expect(decoded[0]!.userMsg.messageId).not.toBe(decoded[1]!.userMsg.messageId);
+    const text = (req.action.action.value as any).userMessage.text as string;
+    // Full content preserved — no 1000/800-char slicing from the old archiver.
+    expect(text).toContain(longUser);
+    expect(text).toContain(longAssistant);
   });
 });
 
 // ── Fork via checkpoint discard + reconstruction ──
 
-describe("fork discards checkpoint, reconstruction takes over", () => {
-  test("fork scenario — checkpoint discarded, turns reconstructed from messages", () => {
+describe("fork discards checkpoint, history inlined into the message", () => {
+  test("fork scenario — checkpoint discarded, prior turns inlined as text", () => {
     const turns = [turn("first", [assistantStep("response1")])];
     const payload = buildCursorRequest(
       "gpt-5",
@@ -1179,14 +1155,11 @@ describe("fork discards checkpoint, reconstruction takes over", () => {
     );
     const req = decodeRunRequest(payload);
 
-    const decoded = decodeTurns(req.conversationState, payload.blobStore);
-    expect(decoded).toHaveLength(1);
-    expect(decoded[0]!.userMsg.text).toBe("first");
-    expect((decoded[0]!.steps[0]!.message.value as any).text).toBe("response1");
-
-    const userAction = req.action.action.value as any;
-    expect(userAction.userMessage.text).toBe("forked question");
-    expect(userAction.userMessage.text).not.toContain("<conversation_history>");
+    expect(req.conversationState.turns).toHaveLength(0);
+    const text = (req.action.action.value as any).userMessage.text as string;
+    expect(text).toContain("first");
+    expect(text).toContain("response1");
+    expect(text.endsWith("forked question")).toBe(true);
   });
 
   test("fork to beginning — no turns, no reconstruction", () => {

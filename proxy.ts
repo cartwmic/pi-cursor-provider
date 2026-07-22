@@ -1923,21 +1923,27 @@ const TURN_ARCHIVE_THRESHOLD =
  * use as the `summary` field of a ConversationSummaryArchive.  Tool results
  * are truncated so the archive blob stays small.
  */
-function buildTurnsTranscript(turns: ParsedTurn[]): string {
+// Full, non-truncating transcript of prior turns. Used to inline history as
+// TEXT into the current user message on a cold start (no server checkpoint),
+// because Cursor ignores client-reconstructed conversation STATE but honours
+// the live prompt. "Totality" is intentional: if the result overflows the
+// model's context, Cursor rejects the request (resource_exhausted ->
+// CONTEXT_OVERFLOW_MSG), which is the desired hard failure.
+function buildFullTurnsTranscript(turns: ParsedTurn[]): string {
   const parts: string[] = [
     `[Earlier conversation — ${turns.length} turn(s)]\n`,
   ];
   for (const [i, turn] of turns.entries()) {
     parts.push(`Turn ${i + 1}:`);
-    if (turn.userText) parts.push(`User: ${turn.userText.slice(0, 1000)}`);
+    if (turn.userText) parts.push(`User: ${turn.userText}`);
     for (const step of turn.steps) {
       if (step.kind === "assistantText") {
-        if (step.text) parts.push(`Assistant: ${step.text.slice(0, 800)}`);
+        if (step.text) parts.push(`Assistant: ${step.text}`);
       } else if (step.kind === "toolCall") {
-        const argsStr = JSON.stringify(step.arguments).slice(0, 300);
+        const argsStr = JSON.stringify(step.arguments);
         parts.push(`Tool: ${step.toolName}(${argsStr})`);
         if (step.result?.content) {
-          parts.push(`Result: ${step.result.content.slice(0, 400)}`);
+          parts.push(`Result: ${step.result.content}`);
         }
       }
     }
@@ -2039,6 +2045,9 @@ export function buildCursorRequest(
   );
 
   let conversationState;
+  // Set on a cold start (no checkpoint) to the full prior transcript, which is
+  // inlined as text into the current user message (see below).
+  let coldStartHistory = "";
   if (checkpoint) {
     conversationState = fromBinary(
       ConversationStateStructureSchema,
@@ -2095,78 +2104,27 @@ export function buildCursorRequest(
       }
     }
   } else {
-    // When rebuilding from scratch (no checkpoint), archive old parsed turns
-    // directly — we have their text, no blob parsing needed.
-    const olderTurns =
-      turns.length > TURN_ARCHIVE_THRESHOLD
-        ? turns.slice(0, turns.length - TURN_ARCHIVE_THRESHOLD)
-        : [];
-    const recentTurns =
-      turns.length > TURN_ARCHIVE_THRESHOLD
-        ? turns.slice(-TURN_ARCHIVE_THRESHOLD)
-        : turns;
-
-    const summaryArchives: Uint8Array[] = [];
-    if (olderTurns.length > 0) {
-      const archive = create(ConversationSummaryArchiveSchema, {
-        summarizedMessages: [], // no blob IDs yet — turns haven't been stored
-        summary: buildTurnsTranscript(olderTurns),
-        windowTail: olderTurns.length,
-        summaryMessage: new Uint8Array(0),
-      });
-      summaryArchives.push(
-        storeAsBlob(
-          toBinary(ConversationSummaryArchiveSchema, archive),
-          blobStore,
-        ),
-      );
-      debugLog("cursor_request.turns_archived_from_scratch", {
-        archivedCount: olderTurns.length,
-        remaining: recentTurns.length,
-      });
+    // Cold start: no server checkpoint (fresh process resume, or a session that
+    // predates checkpoint persistence). Cursor ignores client-reconstructed
+    // conversation STATE (structured turns/archives were sent here previously
+    // and the server does not treat them as authoritative), so we start a
+    // genuinely empty conversation and instead inline the full prior transcript
+    // as TEXT into the current user message below. Cursor then builds its own
+    // authoritative checkpoint from this turn; subsequent turns are
+    // incremental, and the durable sidecar persists it across future resumes.
+    if (!summarize && turns.length > 0) {
+      coldStartHistory = buildFullTurnsTranscript(turns);
     }
-
-    const turnBlobIds: Uint8Array[] = [];
-    for (const turn of recentTurns) {
-      const userMsg = createUserMessage(
-        turn.userText,
-        selectedCtxBlob,
-        turn.images,
-      );
-      const userMsgBlobId = storeAsBlob(
-        toBinary(UserMessageSchema, userMsg),
-        blobStore,
-      );
-      const stepBlobIds = turn.steps.map((s) =>
-        storeAsBlob(buildTurnStepBytes(s), blobStore),
-      );
-
-      const agentTurn = create(AgentConversationTurnStructureSchema, {
-        userMessage: userMsgBlobId,
-        steps: stepBlobIds,
-        requestId: crypto.randomUUID(),
-      });
-      const turnStructure = create(ConversationTurnStructureSchema, {
-        turn: { case: "agentConversationTurn", value: agentTurn },
-      });
-      turnBlobIds.push(
-        storeAsBlob(
-          toBinary(ConversationTurnStructureSchema, turnStructure),
-          blobStore,
-        ),
-      );
-    }
-
     conversationState = create(ConversationStateStructureSchema, {
       rootPromptMessagesJson: [systemBlobId],
-      turns: turnBlobIds,
+      turns: [],
       todos: [],
       pendingToolCalls: [],
       previousWorkspaceUris: [],
       mode: 1,
       fileStates: {},
       fileStatesV2: {},
-      summaryArchives,
+      summaryArchives: [],
       turnTimings: [],
       subagentStates: {},
       selfSummaryCount: 0,
@@ -2175,7 +2133,14 @@ export function buildCursorRequest(
     });
   }
 
-  const userMessage = createUserMessage(userText, selectedCtxBlob, userImages);
+  const effectiveUserText = coldStartHistory
+    ? `${coldStartHistory}\n[End of earlier conversation. Continue from here; the latest user message follows.]\n\n${userText}`
+    : userText;
+  const userMessage = createUserMessage(
+    effectiveUserText,
+    selectedCtxBlob,
+    userImages,
+  );
   // When `summarize` is set, send Cursor's native summarizeAction instead of a
   // user turn. Cursor summarizes the server-side conversation and returns a
   // reduced ConversationState (verified: ~50-80% usedTokens reduction across
