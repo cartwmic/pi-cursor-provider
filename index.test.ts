@@ -36,7 +36,10 @@ import {
   buildCursorRequest,
   flushConversationState,
   hydrateConversationForSession,
+  invalidateSessionState,
+  noteSessionLeaf,
   parseMessages,
+  persistSessionState,
   setBridgeFactoryForTests,
   startProxy,
   stopProxy,
@@ -2624,5 +2627,111 @@ describe("durable conversation-state persistence (resume across process)", () =>
     writeFileSync(join(stateDir, `${convKey}.json`), "{ not valid json");
     __testInternals.conversationStates.clear();
     expect(hydrateConversationForSession(sessionId)).toBe(false);
+  });
+
+  test("persistSessionState stamps the leaf; hydrate is gated on a matching leaf", () => {
+    const sessionId = "resume-session-E";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: deterministicConversationId(convKey),
+      checkpoint: new Uint8Array([7, 7, 7]),
+      blobStore: new Map(),
+    });
+    persistSessionState(sessionId, "leaf-A");
+
+    // Fresh process.
+    __testInternals.conversationStates.clear();
+    // Wrong leaf -> refuse to adopt (this is the tree-navigation guard).
+    expect(hydrateConversationForSession(sessionId, "leaf-B")).toBe(false);
+    expect(__testInternals.conversationStates.has(convKey)).toBe(false);
+    // Matching leaf -> adopt.
+    expect(hydrateConversationForSession(sessionId, "leaf-A")).toBe(true);
+    expect(
+      Array.from(__testInternals.conversationStates.get(convKey)!.checkpoint!),
+    ).toEqual([7, 7, 7]);
+  });
+
+  test("noteSessionLeaf updates the leaf that the next flush records", () => {
+    const sessionId = "resume-session-F";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: deterministicConversationId(convKey),
+      checkpoint: new Uint8Array([1]),
+      blobStore: new Map(),
+      leafId: "stale",
+    });
+    noteSessionLeaf(sessionId, "leaf-current");
+    flushConversationState(convKey);
+    __testInternals.conversationStates.clear();
+    expect(hydrateConversationForSession(sessionId, "stale")).toBe(false);
+    expect(hydrateConversationForSession(sessionId, "leaf-current")).toBe(true);
+  });
+
+  test("invalidateSessionState removes the sidecar and cancels pending writes", () => {
+    const sessionId = "resume-session-G";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: deterministicConversationId(convKey),
+      checkpoint: new Uint8Array([9]),
+      blobStore: new Map(),
+      leafId: "leaf-A",
+    });
+    flushConversationState(convKey);
+    expect(existsSync(join(stateDir, `${convKey}.json`))).toBe(true);
+
+    invalidateSessionState(sessionId);
+    expect(existsSync(join(stateDir, `${convKey}.json`))).toBe(false);
+    __testInternals.conversationStates.clear();
+    expect(hydrateConversationForSession(sessionId, "leaf-A")).toBe(false);
+  });
+
+  test("F1 regression: a tree navigation does not resurrect the abandoned leaf's checkpoint", () => {
+    // Tree navigation keeps the SAME sessionId/convKey but moves to a new leaf.
+    // Wire the real lifecycle handlers and drive the exact event sequence.
+    const handlers = new Map<string, Function>();
+    registerSessionLifecycleCleanup({
+      on: (e: string, h: Function) => handlers.set(e, h),
+    } as any);
+
+    const sessionId = "tree-session";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    // A checkpoint captured on the original leaf, persisted.
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: deterministicConversationId(convKey),
+      checkpoint: new Uint8Array([42]),
+      blobStore: new Map(),
+      leafId: "leaf-original",
+    });
+    flushConversationState(convKey);
+    expect(existsSync(join(stateDir, `${convKey}.json`))).toBe(true);
+
+    // /tree -> session_before_tree fires; then in-memory is gone (fresh leaf).
+    handlers.get("session_before_tree")?.({}, {
+      sessionManager: { getSessionId: () => sessionId, getLeafId: () => "leaf-new" },
+    });
+    // Sidecar invalidated; nothing to re-adopt.
+    expect(existsSync(join(stateDir, `${convKey}.json`))).toBe(false);
+    expect(__testInternals.conversationStates.has(convKey)).toBe(false);
+    // Even if a sidecar somehow lingered, hydration at the new leaf is refused.
+    expect(hydrateConversationForSession(sessionId, "leaf-new")).toBe(false);
+  });
+
+  test("shutdown persists the current leaf so resume rehydrates it", () => {
+    const handlers = new Map<string, Function>();
+    registerSessionLifecycleCleanup({
+      on: (e: string, h: Function) => handlers.set(e, h),
+    } as any);
+    const sessionId = "shutdown-session";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: deterministicConversationId(convKey),
+      checkpoint: new Uint8Array([5, 6]),
+      blobStore: new Map(),
+    });
+    handlers.get("session_shutdown")?.({}, {
+      sessionManager: { getSessionId: () => sessionId, getLeafId: () => "leaf-Z" },
+    });
+    expect(__testInternals.conversationStates.has(convKey)).toBe(false);
+    expect(hydrateConversationForSession(sessionId, "leaf-Z")).toBe(true);
   });
 });

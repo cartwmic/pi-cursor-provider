@@ -32,7 +32,10 @@ import {
   getCursorModels,
   hydrateConversationForSession,
   inferContextWindow,
+  invalidateSessionState,
   loadCachedModels,
+  noteSessionLeaf,
+  persistSessionState,
   startProxy,
   summarizeSessionAndGetSummary,
   type CursorModel,
@@ -522,33 +525,80 @@ export const FALLBACK_MODELS: CursorModel[] = (
 
 // ── Extension ──
 
+type LifecycleCtx = {
+  sessionManager: { getSessionId(): string; getLeafId?: () => string | null };
+};
+
 export function registerSessionLifecycleCleanup(pi: ExtensionAPI): void {
-  const cleanupCurrentSession = (
-    _event: unknown,
-    ctx: {
-      sessionManager: { getSessionId(): string; getLeafId?: () => string | null };
-    },
-  ) => {
-    debugExtensionLog("session.cleanup_hook", {
-      sessionId: ctx.sessionManager.getSessionId(),
-      leafId: ctx.sessionManager.getLeafId?.(),
-    });
-    cleanupSessionState(ctx.sessionManager.getSessionId());
+  const leafOf = (ctx: LifecycleCtx): string | null =>
+    ctx.sessionManager.getLeafId?.() ?? null;
+
+  // shutdown / switch / fork: the current session's checkpoint remains valid
+  // for its current leaf, so persist it (stamped with that leaf) before
+  // dropping in-memory state. A later resume rehydrates the exact branch. Fork
+  // creates a NEW session file (new sessionId => new convKey), so the child
+  // starts fresh and never inherits the parent's sidecar.
+  const persistAndCleanup = (_event: unknown, ctx: LifecycleCtx) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    debugExtensionLog("session.persist_cleanup", { sessionId, leafId: leafOf(ctx) });
+    try {
+      persistSessionState(sessionId, leafOf(ctx));
+    } catch (err) {
+      debugExtensionLog("session.persist_cleanup_error", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    cleanupSessionState(sessionId);
   };
 
-  pi.on("session_before_switch", cleanupCurrentSession);
-  pi.on("session_before_fork", cleanupCurrentSession);
-  pi.on("session_before_tree", cleanupCurrentSession);
-  pi.on("session_shutdown", cleanupCurrentSession);
+  // tree navigation stays in the SAME session file (same sessionId/convKey) but
+  // moves to a different leaf, so the current checkpoint no longer matches the
+  // active message path. Invalidate the sidecar (and drop in-memory state) so
+  // the new branch starts fresh and cannot re-adopt the abandoned checkpoint.
+  const invalidateAndCleanup = (_event: unknown, ctx: LifecycleCtx) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    debugExtensionLog("session.invalidate_cleanup", { sessionId, leafId: leafOf(ctx) });
+    try {
+      invalidateSessionState(sessionId);
+    } catch (err) {
+      debugExtensionLog("session.invalidate_cleanup_error", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    cleanupSessionState(sessionId);
+  };
+
+  pi.on("session_before_switch", persistAndCleanup);
+  pi.on("session_before_fork", persistAndCleanup);
+  pi.on("session_shutdown", persistAndCleanup);
+  pi.on("session_before_tree", invalidateAndCleanup);
+
+  // Keep the persisted leaf id fresh so shutdown/switch/fork stamp the current
+  // branch even if the debounced write races the leaf advancing.
+  const noteLeaf = (_event: unknown, ctx: LifecycleCtx) => {
+    try {
+      noteSessionLeaf(ctx.sessionManager.getSessionId(), leafOf(ctx));
+    } catch {
+      /* best-effort leaf stamp */
+    }
+  };
+  pi.on("turn_end", noteLeaf);
+  pi.on("agent_end", noteLeaf);
 
   // On (re)start, warm the durable Cursor checkpoint from disk so a resumed
   // session can run native summarizeAction immediately — including a manual
-  // /compact before any new turn. No-op for brand-new sessions (no sidecar).
+  // /compact before any new turn. Adoption is gated on the persisted leaf id
+  // matching pi's current leaf, so a stale/branched sidecar is ignored. No-op
+  // for brand-new sessions (no sidecar).
   pi.on("session_start", (_event, ctx) => {
     try {
       const sessionId = ctx.sessionManager.getSessionId();
-      const hydrated = hydrateConversationForSession(sessionId);
-      debugExtensionLog("session.start_hydrate", { sessionId, hydrated });
+      const hydrated = hydrateConversationForSession(sessionId, leafOf(ctx));
+      debugExtensionLog("session.start_hydrate", {
+        sessionId,
+        leafId: leafOf(ctx),
+        hydrated,
+      });
     } catch (err) {
       debugExtensionLog("session.start_hydrate_error", {
         error: err instanceof Error ? err.message : String(err),
@@ -606,13 +656,28 @@ export function registerSessionLifecycleCleanup(pi: ExtensionAPI): void {
 
     try {
       const result = await summarizeSessionAndGetSummary(sessionId);
-      if (!result.ok || !result.summary) {
+      // Require an actual server-side compaction: ok (2xx) + a decodable
+      // summary + a mutated checkpoint. A 2xx response that did NOT change the
+      // checkpoint means summarizeAction was a no-op; the field-6 summary we
+      // would decode is the PREVIOUS compaction's summary. Committing it with
+      // the new firstKeptEntryId would silently discard every message added
+      // since that older summary. Treat !mutated as failure.
+      if (!result.ok || !result.summary || !result.mutated) {
         debugExtensionLog("session.before_compact_native_failed", {
           sessionId,
           ok: result.ok,
           mutated: result.mutated,
           hasSummary: !!result.summary,
         });
+        // Partial mutation (checkpoint changed but no usable summary): the live
+        // checkpoint is now in an ambiguous half-summarized state. Invalidate
+        // the sidecar and drop in-memory state so the next turn rebuilds a
+        // clean checkpoint from pi's messages instead of persisting the
+        // ambiguous one.
+        if (result.mutated) {
+          invalidateSessionState(sessionId);
+          cleanupSessionState(sessionId);
+        }
         if (ctx.hasUI) {
           ctx.ui.notify(
             result.mutated

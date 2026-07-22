@@ -23,11 +23,16 @@ import { createHash } from "node:crypto";
 import {
   appendFileSync,
   chmodSync,
+  closeSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
   renameSync,
+  rmSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { resolve as pathResolve, dirname, join as pathJoin } from "node:path";
@@ -224,6 +229,14 @@ export interface StoredConversation {
    * reuse a valid model for the summarizeAction round-trip.
    */
   lastModelId?: string;
+  /**
+   * pi session-tree leaf id this checkpoint was captured at. A Cursor
+   * checkpoint is only valid for the exact message path it was built from, so
+   * rehydration on resume is gated on this matching pi's current leaf. This is
+   * what prevents a tree navigation (which keeps the same sessionId/convKey but
+   * changes the leaf) from reusing an abandoned branch's server checkpoint.
+   */
+  leafId?: string;
 }
 
 interface StreamState {
@@ -345,6 +358,7 @@ interface SerializedConversation {
   lastTotalTokens?: number;
   systemPrompt?: string;
   lastModelId?: string;
+  leafId?: string;
 }
 
 function serializeConversation(
@@ -365,6 +379,7 @@ function serializeConversation(
     lastTotalTokens: stored.lastTotalTokens,
     systemPrompt: stored.systemPrompt,
     lastModelId: stored.lastModelId,
+    leafId: stored.leafId,
   };
 }
 
@@ -392,21 +407,29 @@ function deserializeConversation(
     lastTotalTokens: raw.lastTotalTokens,
     systemPrompt: raw.systemPrompt,
     lastModelId: raw.lastModelId,
+    leafId: raw.leafId,
   };
 }
 
 function writeConversationStateNow(convKey: string): void {
   const stored = conversationStates.get(convKey);
   if (!stored || !stored.checkpoint) return; // nothing durable yet
+  const target = conversationStateFile(convKey);
+  const tmp = `${target}.tmp-${process.pid}-${Math.random()
+    .toString(36)
+    .slice(2)}`;
   try {
-    const dir = conversationStateDir();
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const target = conversationStateFile(convKey);
-    const tmp = `${target}.tmp-${process.pid}-${Math.random()
-      .toString(36)
-      .slice(2)}`;
+    mkdirSync(conversationStateDir(), { recursive: true, mode: 0o700 });
     const payload = JSON.stringify(serializeConversation(stored));
-    writeFileSync(tmp, payload, { encoding: "utf8", mode: 0o600 });
+    // Write + fsync the temp file before the atomic rename so a crash cannot
+    // leave a torn or unflushed "durable" checkpoint behind.
+    const fd = openSync(tmp, "w", 0o600);
+    try {
+      writeSync(fd, payload, null, "utf8");
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
     try {
       chmodSync(tmp, 0o600);
     } catch {
@@ -417,8 +440,14 @@ function writeConversationStateNow(convKey: string): void {
       convKey,
       bytes: payload.length,
       blobCount: stored.blobStore.size,
+      leafId: stored.leafId,
     });
   } catch (err) {
+    try {
+      if (existsSync(tmp)) rmSync(tmp, { force: true });
+    } catch {
+      /* best-effort temp cleanup */
+    }
     debugLog("persist.write_error", {
       convKey,
       error: err instanceof Error ? err.message : String(err),
@@ -452,26 +481,46 @@ export function flushConversationState(convKey: string): void {
 }
 
 /**
- * Ensure a conversation's state is present in memory, rehydrating from the
- * durable sidecar when the in-memory entry is missing or has no checkpoint
- * (e.g. right after resuming a session in a fresh process). Never overwrites a
- * live in-memory checkpoint.
+ * Rehydrate a session's conversation state from the durable sidecar into memory
+ * on resume. This is the ONLY path that reads persisted state back — the chat
+ * and summarize paths never lazily load from disk, so a stale sidecar can never
+ * silently resurrect an abandoned checkpoint.
+ *
+ * A Cursor checkpoint is valid only for the exact message path it was built
+ * from, so adoption is gated on the persisted leaf id matching pi's current
+ * leaf. This is what keeps a tree navigation — which keeps the same
+ * sessionId/convKey but moves to a different leaf — from reusing the previous
+ * branch's server checkpoint. A live in-memory checkpoint is never clobbered.
  */
-function ensureConversationLoaded(
-  convKey: string,
-): StoredConversation | undefined {
+export function hydrateConversationForSession(
+  sessionId?: string,
+  leafId?: string | null,
+): boolean {
+  if (!sessionId) return false;
+  const convKey = deriveConversationKeyFromSessionId(sessionId);
   const current = conversationStates.get(convKey);
-  if (current?.checkpoint) return current;
+  if (current?.checkpoint) return true; // live state wins; never clobber
   const file = conversationStateFile(convKey);
-  if (!existsSync(file)) return current;
+  if (!existsSync(file)) return false;
   try {
     const raw = JSON.parse(
       readFileSync(file, "utf8"),
     ) as SerializedConversation;
     const loaded = deserializeConversation(raw);
-    if (!loaded) {
+    if (!loaded || !loaded.checkpoint) {
       debugLog("persist.load_invalid", { convKey });
-      return current;
+      return false;
+    }
+    // Leaf gate: refuse to adopt a checkpoint captured at a different leaf than
+    // pi is currently on (tree navigation, edited/branched session, etc.).
+    const wantLeaf = leafId ?? undefined;
+    if (loaded.leafId !== wantLeaf) {
+      debugLog("persist.load_leaf_mismatch", {
+        convKey,
+        storedLeafId: loaded.leafId,
+        currentLeafId: wantLeaf,
+      });
+      return false;
     }
     // Preserve request-scoped fields already set on a fresh in-memory entry.
     if (current) {
@@ -482,24 +531,68 @@ function ensureConversationLoaded(
     debugLog("persist.load", {
       convKey,
       blobCount: loaded.blobStore.size,
-      hasCheckpoint: !!loaded.checkpoint,
+      leafId: loaded.leafId,
     });
-    return loaded;
+    return true;
   } catch (err) {
     debugLog("persist.load_error", {
       convKey,
       error: err instanceof Error ? err.message : String(err),
     });
-    return current;
+    return false;
   }
 }
 
-/** Rehydrate a session's conversation state from disk (used on session_start). */
-export function hydrateConversationForSession(sessionId?: string): boolean {
-  if (!sessionId) return false;
+/**
+ * Stamp the current pi leaf id onto the in-memory conversation so the next
+ * durable write records which branch the checkpoint belongs to. No-op if the
+ * session has no in-memory state yet.
+ */
+export function noteSessionLeaf(sessionId?: string, leafId?: string | null): void {
+  if (!sessionId) return;
   const convKey = deriveConversationKeyFromSessionId(sessionId);
-  const loaded = ensureConversationLoaded(convKey);
-  return !!loaded?.checkpoint;
+  const stored = conversationStates.get(convKey);
+  if (stored) stored.leafId = leafId ?? undefined;
+}
+
+/**
+ * Stamp the leaf id and synchronously flush a session's state to disk. Used on
+ * shutdown/switch/fork so a later resume can rehydrate the exact branch.
+ */
+export function persistSessionState(
+  sessionId?: string,
+  leafId?: string | null,
+): void {
+  if (!sessionId) return;
+  const convKey = deriveConversationKeyFromSessionId(sessionId);
+  const stored = conversationStates.get(convKey);
+  if (stored) stored.leafId = leafId ?? undefined;
+  flushConversationState(convKey);
+}
+
+/**
+ * Invalidate a session's durable sidecar (and any pending write). Used when the
+ * active message path changes such that the persisted checkpoint is no longer
+ * authoritative — e.g. after a tree navigation on the same sessionId.
+ */
+export function invalidateSessionState(sessionId?: string): void {
+  if (!sessionId) return;
+  const convKey = deriveConversationKeyFromSessionId(sessionId);
+  const existing = persistTimers.get(convKey);
+  if (existing) {
+    clearTimeout(existing);
+    persistTimers.delete(convKey);
+  }
+  try {
+    const file = conversationStateFile(convKey);
+    if (existsSync(file)) rmSync(file, { force: true });
+    debugLog("persist.invalidate", { convKey });
+  } catch (err) {
+    debugLog("persist.invalidate_error", {
+      convKey,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 function isProxyDebugEnabled(): boolean {
@@ -1336,7 +1429,6 @@ async function handleChatCompletion(
     cleanupBridge(activeBridge.bridge, activeBridge.heartbeatTimer, bridgeKey);
   }
 
-  ensureConversationLoaded(convKey);
   let stored = conversationStates.get(convKey);
   debugLog("chat.stored_state.before", { requestId, convKey, stored });
   if (!stored) {
@@ -2565,7 +2657,6 @@ export function deriveConversationKey(
 export async function summarizeSession(sessionId?: string): Promise<boolean> {
   if (!sessionId) return false;
   const convKey = deriveConversationKeyFromSessionId(sessionId);
-  ensureConversationLoaded(convKey);
   const stored = conversationStates.get(convKey);
   if (!stored?.checkpoint) {
     debugLog("summarize.skip_no_checkpoint", { sessionId, convKey });
@@ -2685,7 +2776,6 @@ export async function summarizeSessionAndGetSummary(
 ): Promise<NativeCompactionResult> {
   if (!sessionId) return { ok: false, mutated: false };
   const convKey = deriveConversationKeyFromSessionId(sessionId);
-  ensureConversationLoaded(convKey);
   const before = conversationStates.get(convKey);
   const beforeHex = before?.checkpoint
     ? Buffer.from(before.checkpoint).toString("hex")
@@ -2727,11 +2817,10 @@ export function cleanupSessionState(sessionId?: string): void {
     hadConversation: conversationStates.has(convKey),
   });
   if (active) cleanupBridge(active.bridge, active.heartbeatTimer, bridgeKey);
-  // Persist the latest state before dropping it from memory so a later resume
-  // (or switch back) can rehydrate. The sidecar file itself is never deleted
-  // here — only the in-memory entry. Fork/tree children use a different
-  // convKey, so flushing the current (parent) session does not leak into them.
-  flushConversationState(convKey);
+  // Drops in-memory state + bridge only. Durable persistence is handled
+  // explicitly by the lifecycle hooks (persistSessionState on shutdown/switch/
+  // fork, invalidateSessionState on tree) so that a same-sessionId tree
+  // navigation never re-adopts the abandoned branch's checkpoint.
   conversationStates.delete(convKey);
 }
 
