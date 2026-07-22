@@ -30,6 +30,7 @@ import {
 import {
   cleanupSessionState,
   getCursorModels,
+  hydrateConversationForSession,
   inferContextWindow,
   loadCachedModels,
   startProxy,
@@ -539,6 +540,21 @@ export function registerSessionLifecycleCleanup(pi: ExtensionAPI): void {
   pi.on("session_before_fork", cleanupCurrentSession);
   pi.on("session_before_tree", cleanupCurrentSession);
   pi.on("session_shutdown", cleanupCurrentSession);
+
+  // On (re)start, warm the durable Cursor checkpoint from disk so a resumed
+  // session can run native summarizeAction immediately — including a manual
+  // /compact before any new turn. No-op for brand-new sessions (no sidecar).
+  pi.on("session_start", (_event, ctx) => {
+    try {
+      const sessionId = ctx.sessionManager.getSessionId();
+      const hydrated = hydrateConversationForSession(sessionId);
+      debugExtensionLog("session.start_hydrate", { sessionId, hydrated });
+    } catch (err) {
+      debugExtensionLog("session.start_hydrate_error", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
 
   // Cursor compaction is server-authoritative. On `session_before_compact` we
   // run Cursor's native `summarizeAction` (verified to cut usedTokens ~50-80%),

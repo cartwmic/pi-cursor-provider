@@ -22,9 +22,11 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   appendFileSync,
+  chmodSync,
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -305,6 +307,200 @@ const conversationStates = new Map<string, StoredConversation>();
 let bridgeFactory: BridgeFactory = spawnBridge;
 let debugRequestCounter = 0;
 let debugLogFilePath: string | undefined;
+
+// ── Durable conversation-state persistence (survives restart / resume) ──
+//
+// Cursor's server-side compaction is authoritative, but the local
+// StoredConversation (checkpoint + blob graph) that lets us address it is
+// in-memory only. Without persistence, resuming a session in a fresh pi
+// process leaves no checkpoint, so native summarizeAction has nothing to act
+// on and compaction fails. We serialize each conversation's checkpoint + blob
+// graph to a per-session sidecar and rehydrate it on demand. Writes are
+// debounced + atomic (temp file + rename, mode 0600); reads happen lazily when
+// an in-memory entry is missing or has no checkpoint. Fork/tree children get a
+// new sessionId (new convKey) and therefore do NOT inherit the parent's
+// sidecar — preserving the existing "start fresh on branch" safety.
+
+const PERSIST_VERSION = 1;
+const PERSIST_DEBOUNCE_MS = 750;
+const persistTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function conversationStateDir(): string {
+  const override = process.env.PI_CURSOR_PROVIDER_STATE_DIR?.trim();
+  return override && override.length > 0
+    ? override
+    : pathJoin(homedir(), ".pi", "agent", "state", "cursor-provider");
+}
+
+function conversationStateFile(convKey: string): string {
+  return pathJoin(conversationStateDir(), `${convKey}.json`);
+}
+
+interface SerializedConversation {
+  v: number;
+  conversationId: string;
+  checkpoint: string | null; // base64
+  blobStore: Record<string, string>; // hex id -> base64
+  effectiveContextWindow?: number;
+  lastTotalTokens?: number;
+  systemPrompt?: string;
+  lastModelId?: string;
+}
+
+function serializeConversation(
+  stored: StoredConversation,
+): SerializedConversation {
+  const blobStore: Record<string, string> = {};
+  for (const [k, v] of stored.blobStore) {
+    blobStore[k] = Buffer.from(v).toString("base64");
+  }
+  return {
+    v: PERSIST_VERSION,
+    conversationId: stored.conversationId,
+    checkpoint: stored.checkpoint
+      ? Buffer.from(stored.checkpoint).toString("base64")
+      : null,
+    blobStore,
+    effectiveContextWindow: stored.effectiveContextWindow,
+    lastTotalTokens: stored.lastTotalTokens,
+    systemPrompt: stored.systemPrompt,
+    lastModelId: stored.lastModelId,
+  };
+}
+
+function deserializeConversation(
+  raw: SerializedConversation,
+): StoredConversation | undefined {
+  if (
+    !raw ||
+    raw.v !== PERSIST_VERSION ||
+    typeof raw.conversationId !== "string"
+  ) {
+    return undefined;
+  }
+  const blobStore = new Map<string, Uint8Array>();
+  for (const [k, b64] of Object.entries(raw.blobStore ?? {})) {
+    blobStore.set(k, new Uint8Array(Buffer.from(b64, "base64")));
+  }
+  return {
+    conversationId: raw.conversationId,
+    checkpoint: raw.checkpoint
+      ? new Uint8Array(Buffer.from(raw.checkpoint, "base64"))
+      : null,
+    blobStore,
+    effectiveContextWindow: raw.effectiveContextWindow,
+    lastTotalTokens: raw.lastTotalTokens,
+    systemPrompt: raw.systemPrompt,
+    lastModelId: raw.lastModelId,
+  };
+}
+
+function writeConversationStateNow(convKey: string): void {
+  const stored = conversationStates.get(convKey);
+  if (!stored || !stored.checkpoint) return; // nothing durable yet
+  try {
+    const dir = conversationStateDir();
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const target = conversationStateFile(convKey);
+    const tmp = `${target}.tmp-${process.pid}-${Math.random()
+      .toString(36)
+      .slice(2)}`;
+    const payload = JSON.stringify(serializeConversation(stored));
+    writeFileSync(tmp, payload, { encoding: "utf8", mode: 0o600 });
+    try {
+      chmodSync(tmp, 0o600);
+    } catch {
+      /* best-effort perms */
+    }
+    renameSync(tmp, target);
+    debugLog("persist.write", {
+      convKey,
+      bytes: payload.length,
+      blobCount: stored.blobStore.size,
+    });
+  } catch (err) {
+    debugLog("persist.write_error", {
+      convKey,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/** Schedule a debounced durable write of a conversation's state. */
+function persistConversationState(convKey: string): void {
+  const existing = persistTimers.get(convKey);
+  if (existing) clearTimeout(existing);
+  const t = setTimeout(() => {
+    persistTimers.delete(convKey);
+    writeConversationStateNow(convKey);
+  }, PERSIST_DEBOUNCE_MS);
+  // Never hold the event loop open solely for a pending persist.
+  if (typeof (t as { unref?: () => void }).unref === "function") {
+    (t as { unref: () => void }).unref();
+  }
+  persistTimers.set(convKey, t);
+}
+
+/** Flush any pending debounced write for a conversation synchronously. */
+export function flushConversationState(convKey: string): void {
+  const existing = persistTimers.get(convKey);
+  if (existing) {
+    clearTimeout(existing);
+    persistTimers.delete(convKey);
+  }
+  writeConversationStateNow(convKey);
+}
+
+/**
+ * Ensure a conversation's state is present in memory, rehydrating from the
+ * durable sidecar when the in-memory entry is missing or has no checkpoint
+ * (e.g. right after resuming a session in a fresh process). Never overwrites a
+ * live in-memory checkpoint.
+ */
+function ensureConversationLoaded(
+  convKey: string,
+): StoredConversation | undefined {
+  const current = conversationStates.get(convKey);
+  if (current?.checkpoint) return current;
+  const file = conversationStateFile(convKey);
+  if (!existsSync(file)) return current;
+  try {
+    const raw = JSON.parse(
+      readFileSync(file, "utf8"),
+    ) as SerializedConversation;
+    const loaded = deserializeConversation(raw);
+    if (!loaded) {
+      debugLog("persist.load_invalid", { convKey });
+      return current;
+    }
+    // Preserve request-scoped fields already set on a fresh in-memory entry.
+    if (current) {
+      loaded.systemPrompt = current.systemPrompt ?? loaded.systemPrompt;
+      loaded.lastModelId = current.lastModelId ?? loaded.lastModelId;
+    }
+    conversationStates.set(convKey, loaded);
+    debugLog("persist.load", {
+      convKey,
+      blobCount: loaded.blobStore.size,
+      hasCheckpoint: !!loaded.checkpoint,
+    });
+    return loaded;
+  } catch (err) {
+    debugLog("persist.load_error", {
+      convKey,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return current;
+  }
+}
+
+/** Rehydrate a session's conversation state from disk (used on session_start). */
+export function hydrateConversationForSession(sessionId?: string): boolean {
+  if (!sessionId) return false;
+  const convKey = deriveConversationKeyFromSessionId(sessionId);
+  const loaded = ensureConversationLoaded(convKey);
+  return !!loaded?.checkpoint;
+}
 
 function isProxyDebugEnabled(): boolean {
   const raw = process.env.PI_CURSOR_PROVIDER_DEBUG?.trim().toLowerCase();
@@ -1140,6 +1336,7 @@ async function handleChatCompletion(
     cleanupBridge(activeBridge.bridge, activeBridge.heartbeatTimer, bridgeKey);
   }
 
+  ensureConversationLoaded(convKey);
   let stored = conversationStates.get(convKey);
   debugLog("chat.stored_state.before", { requestId, convKey, stored });
   if (!stored) {
@@ -2368,6 +2565,7 @@ export function deriveConversationKey(
 export async function summarizeSession(sessionId?: string): Promise<boolean> {
   if (!sessionId) return false;
   const convKey = deriveConversationKeyFromSessionId(sessionId);
+  ensureConversationLoaded(convKey);
   const stored = conversationStates.get(convKey);
   if (!stored?.checkpoint) {
     debugLog("summarize.skip_no_checkpoint", { sessionId, convKey });
@@ -2487,6 +2685,7 @@ export async function summarizeSessionAndGetSummary(
 ): Promise<NativeCompactionResult> {
   if (!sessionId) return { ok: false, mutated: false };
   const convKey = deriveConversationKeyFromSessionId(sessionId);
+  ensureConversationLoaded(convKey);
   const before = conversationStates.get(convKey);
   const beforeHex = before?.checkpoint
     ? Buffer.from(before.checkpoint).toString("hex")
@@ -2528,6 +2727,11 @@ export function cleanupSessionState(sessionId?: string): void {
     hadConversation: conversationStates.has(convKey),
   });
   if (active) cleanupBridge(active.bridge, active.heartbeatTimer, bridgeKey);
+  // Persist the latest state before dropping it from memory so a later resume
+  // (or switch back) can rehydrate. The sidecar file itself is never deleted
+  // here — only the in-memory entry. Fork/tree children use a different
+  // convKey, so flushing the current (parent) session does not leak into them.
+  flushConversationState(convKey);
   conversationStates.delete(convKey);
 }
 
@@ -3263,6 +3467,7 @@ function writeSSEStream(
         if (state.totalTokens > 0) {
           stored.lastTotalTokens = state.totalTokens;
         }
+        if (latestCheckpoint) persistConversationState(convKey);
       }
       if (cancelled) return;
 
@@ -3705,6 +3910,7 @@ async function handleNonStreamingResponse(
         if (state.totalTokens > 0) {
           stored.lastTotalTokens = state.totalTokens;
         }
+        if (latestCheckpoint) persistConversationState(convKey);
       }
 
       if (cancelled) {

@@ -1,7 +1,17 @@
 import rawModels from "./cursor-models-raw.json" with { type: "json" };
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { EventEmitter } from "node:events";
 import { request as httpRequest } from "node:http";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   buildEffortMap,
   FALLBACK_MODELS,
@@ -24,6 +34,8 @@ import {
   derivePiSessionId,
   deterministicConversationId,
   buildCursorRequest,
+  flushConversationState,
+  hydrateConversationForSession,
   parseMessages,
   setBridgeFactoryForTests,
   startProxy,
@@ -2505,5 +2517,112 @@ describe("summarizeSession — native summarizeAction on compaction", () => {
   test("no-ops (returns false) when the session has no checkpoint", async () => {
     const ok = await summarizeSession("session-never-seen");
     expect(ok).toBe(false);
+  });
+});
+
+describe("durable conversation-state persistence (resume across process)", () => {
+  let stateDir: string;
+  let prevStateDir: string | undefined;
+
+  beforeEach(() => {
+    prevStateDir = process.env.PI_CURSOR_PROVIDER_STATE_DIR;
+    stateDir = mkdtempSync(join(tmpdir(), "cursor-state-test-"));
+    process.env.PI_CURSOR_PROVIDER_STATE_DIR = stateDir;
+  });
+  afterEach(() => {
+    if (prevStateDir === undefined) delete process.env.PI_CURSOR_PROVIDER_STATE_DIR;
+    else process.env.PI_CURSOR_PROVIDER_STATE_DIR = prevStateDir;
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  function seedStored(sessionId: string) {
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const checkpoint = new Uint8Array([1, 2, 3, 4, 5, 250, 251, 252]);
+    const blobStore = new Map<string, Uint8Array>([
+      ["aa", new Uint8Array([9, 8, 7])],
+      ["bb", new Uint8Array([0, 255, 128])],
+    ]);
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: deterministicConversationId(convKey),
+      checkpoint,
+      blobStore,
+      lastModelId: "gpt-5.6-sol",
+      lastTotalTokens: 12345,
+      effectiveContextWindow: 272000,
+      systemPrompt: "sys",
+    });
+    return { convKey, checkpoint, blobStore };
+  }
+
+  test("flush writes an atomic 0600 sidecar; a fresh map rehydrates it exactly", () => {
+    const sessionId = "resume-session-A";
+    const { convKey, checkpoint, blobStore } = seedStored(sessionId);
+
+    flushConversationState(convKey);
+    const file = join(stateDir, `${convKey}.json`);
+    expect(existsSync(file)).toBe(true);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    // No temp files left behind.
+    expect(readdirSync(stateDir).some((f) => f.includes(".tmp-"))).toBe(false);
+
+    // Simulate a fresh process: in-memory state gone.
+    __testInternals.conversationStates.clear();
+    const hydrated = hydrateConversationForSession(sessionId);
+    expect(hydrated).toBe(true);
+
+    const loaded = __testInternals.conversationStates.get(convKey);
+    expect(loaded).toBeDefined();
+    expect(Array.from(loaded!.checkpoint!)).toEqual(Array.from(checkpoint));
+    expect(loaded!.blobStore.size).toBe(blobStore.size);
+    expect(Array.from(loaded!.blobStore.get("aa")!)).toEqual([9, 8, 7]);
+    expect(Array.from(loaded!.blobStore.get("bb")!)).toEqual([0, 255, 128]);
+    expect(loaded!.lastModelId).toBe("gpt-5.6-sol");
+    expect(loaded!.lastTotalTokens).toBe(12345);
+    expect(loaded!.effectiveContextWindow).toBe(272000);
+    expect(loaded!.conversationId).toBe(deterministicConversationId(convKey));
+  });
+
+  test("hydrate is a no-op when no sidecar exists", () => {
+    __testInternals.conversationStates.clear();
+    expect(hydrateConversationForSession("never-persisted")).toBe(false);
+    expect(__testInternals.conversationStates.size).toBe(0);
+  });
+
+  test("hydrate never clobbers a live in-memory checkpoint", () => {
+    const sessionId = "resume-session-B";
+    const { convKey } = seedStored(sessionId);
+    flushConversationState(convKey);
+
+    // A live entry with a different checkpoint must win over the sidecar.
+    const liveCheckpoint = new Uint8Array([42, 42, 42]);
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: deterministicConversationId(convKey),
+      checkpoint: liveCheckpoint,
+      blobStore: new Map(),
+    });
+    expect(hydrateConversationForSession(sessionId)).toBe(true);
+    expect(
+      Array.from(__testInternals.conversationStates.get(convKey)!.checkpoint!),
+    ).toEqual([42, 42, 42]);
+  });
+
+  test("flush is a no-op when there is no checkpoint to persist", () => {
+    const sessionId = "resume-session-C";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: deterministicConversationId(convKey),
+      checkpoint: null,
+      blobStore: new Map(),
+    });
+    flushConversationState(convKey);
+    expect(existsSync(join(stateDir, `${convKey}.json`))).toBe(false);
+  });
+
+  test("a corrupt sidecar is ignored (hydrate returns false, no throw)", () => {
+    const sessionId = "resume-session-D";
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    writeFileSync(join(stateDir, `${convKey}.json`), "{ not valid json");
+    __testInternals.conversationStates.clear();
+    expect(hydrateConversationForSession(sessionId)).toBe(false);
   });
 });
