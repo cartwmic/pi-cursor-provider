@@ -656,24 +656,27 @@ export function registerSessionLifecycleCleanup(pi: ExtensionAPI): void {
 
     try {
       const result = await summarizeSessionAndGetSummary(sessionId);
-      // Require an actual server-side compaction: ok (2xx) + a decodable
-      // summary + a mutated checkpoint. A 2xx response that did NOT change the
-      // checkpoint means summarizeAction was a no-op; the field-6 summary we
-      // would decode is the PREVIOUS compaction's summary. Committing it with
-      // the new firstKeptEntryId would silently discard every message added
-      // since that older summary. Treat !mutated as failure.
-      if (!result.ok || !result.summary || !result.mutated) {
+      // Require a FRESH native summary: ok (2xx) + field-6 summary content that
+      // actually changed as a result of this action. A checkpoint can mutate
+      // (tokenDetails, an appended summarize turn, counters) without producing
+      // a new summary; in that case the decoded field-6 text is the PREVIOUS
+      // compaction's summary, and committing it against the new
+      // firstKeptEntryId would silently discard everything added since. So we
+      // gate on `summaryChanged`, not on whole-checkpoint `mutated`.
+      if (!result.ok || !result.summary || !result.summaryChanged) {
         debugExtensionLog("session.before_compact_native_failed", {
           sessionId,
           ok: result.ok,
           mutated: result.mutated,
+          summaryChanged: result.summaryChanged,
           hasSummary: !!result.summary,
         });
-        // Partial mutation (checkpoint changed but no usable summary): the live
-        // checkpoint is now in an ambiguous half-summarized state. Invalidate
-        // the sidecar and drop in-memory state so the next turn rebuilds a
-        // clean checkpoint from pi's messages instead of persisting the
-        // ambiguous one.
+        // If the checkpoint mutated but no fresh summary was produced, the live
+        // checkpoint may be polluted (e.g. by the loopback summarize turn) or
+        // ambiguous. Invalidate the sidecar and drop in-memory state so the
+        // next turn rebuilds a clean checkpoint from pi's messages rather than
+        // persisting/continuing an ambiguous one. If nothing mutated, the
+        // existing checkpoint is still valid, so leave it untouched.
         if (result.mutated) {
           invalidateSessionState(sessionId);
           cleanupSessionState(sessionId);
@@ -681,7 +684,7 @@ export function registerSessionLifecycleCleanup(pi: ExtensionAPI): void {
         if (ctx.hasUI) {
           ctx.ui.notify(
             result.mutated
-              ? "Cursor native compaction returned no usable summary; compaction skipped."
+              ? "Cursor native compaction did not produce a new summary; compaction skipped."
               : "Cursor native compaction failed; compaction skipped.",
             "warning",
           );

@@ -44,6 +44,7 @@ import {
   startProxy,
   stopProxy,
   summarizeSession,
+  summarizeSessionAndGetSummary,
   writeSSEStreamForTests,
 } from "./proxy.ts";
 import type { CursorModel, ParsedTurn } from "./proxy.ts";
@@ -55,6 +56,8 @@ import {
   CancelActionSchema,
   ConversationActionSchema,
   ConversationStateStructureSchema,
+  ConversationSummarySchema,
+  ConversationTokenDetailsSchema,
   ConversationTurnStructureSchema,
   ConversationStepSchema,
   ExecServerMessageSchema,
@@ -2520,6 +2523,87 @@ describe("summarizeSession — native summarizeAction on compaction", () => {
   test("no-ops (returns false) when the session has no checkpoint", async () => {
     const ok = await summarizeSession("session-never-seen");
     expect(ok).toBe(false);
+  });
+});
+
+describe("summarizeSessionAndGetSummary — fresh-summary gate (F2)", () => {
+  const S1 = new Uint8Array([0x11, 0x11, 0x11, 0x11]);
+  const S2 = new Uint8Array([0x22, 0x22, 0x22, 0x22]);
+  const summaryBlob = (text: string) =>
+    toBinary(ConversationSummarySchema, create(ConversationSummarySchema, { summary: text }));
+  const checkpointBytes = (summaryId: Uint8Array, usedTokens: number) =>
+    toBinary(
+      ConversationStateStructureSchema,
+      create(ConversationStateStructureSchema, {
+        summary: summaryId,
+        tokenDetails: create(ConversationTokenDetailsSchema, { usedTokens }),
+      }),
+    );
+  const checkpointMsgWith = (summaryId: Uint8Array, usedTokens: number) =>
+    create(AgentServerMessageSchema, {
+      message: {
+        case: "conversationCheckpointUpdate",
+        value: create(ConversationStateStructureSchema, {
+          summary: summaryId,
+          tokenDetails: create(ConversationTokenDetailsSchema, { usedTokens }),
+        }),
+      },
+    });
+
+  function seedWithSummary(sessionId: string) {
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: "conv-f2",
+      checkpoint: checkpointBytes(S1, 100),
+      blobStore: new Map<string, Uint8Array>([
+        [Buffer.from(S1).toString("hex"), summaryBlob("OLD SUMMARY")],
+      ]),
+      lastModelId: "gpt-5",
+    });
+  }
+
+  test("accepts when summarizeAction produces a NEW field-6 summary", async () => {
+    const sessionId = "f2-fresh";
+    seedWithSummary(sessionId);
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            fake.emitServerMessage(makeSetBlobMessage(S2, summaryBlob("NEW SUMMARY")));
+            fake.emitServerMessage(checkpointMsgWith(S2, 40));
+            fake.close(0);
+          }
+        }),
+    );
+    await startProxy(async () => "test-token");
+    const res = await summarizeSessionAndGetSummary(sessionId);
+    expect(res.ok).toBe(true);
+    expect(res.mutated).toBe(true);
+    expect(res.summaryChanged).toBe(true);
+    expect(res.summary).toBe("NEW SUMMARY");
+  });
+
+  test("rejects a 2xx that mutates the checkpoint but leaves field-6 unchanged", async () => {
+    // The stale-summary data-loss case: tokenDetails change (checkpoint bytes
+    // differ => mutated) but the summary blob id is unchanged, so decoding
+    // yields the PREVIOUS summary. Must NOT be treated as a fresh compaction.
+    const sessionId = "f2-stale";
+    seedWithSummary(sessionId);
+    setBridgeFactoryForTests(
+      (options) =>
+        new FakeBridge(options, (clientMessage, fake) => {
+          if (clientMessage.message.case === "runRequest") {
+            fake.emitServerMessage(checkpointMsgWith(S1, 90)); // same summary id, new tokens
+            fake.close(0);
+          }
+        }),
+    );
+    await startProxy(async () => "test-token");
+    const res = await summarizeSessionAndGetSummary(sessionId);
+    expect(res.ok).toBe(true);
+    expect(res.mutated).toBe(true); // checkpoint bytes changed
+    expect(res.summaryChanged).toBe(false); // but no fresh summary => reject
+    expect(res.summary).toBe("OLD SUMMARY"); // decodes the stale one
   });
 });
 

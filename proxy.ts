@@ -2700,8 +2700,17 @@ export async function summarizeSession(sessionId?: string): Promise<boolean> {
 export interface NativeCompactionResult {
   /** True when the summarize round-trip completed successfully. */
   ok: boolean;
-  /** True when Cursor's server checkpoint actually changed (mutation happened). */
+  /** True when Cursor's server checkpoint actually changed (any field). */
   mutated: boolean;
+  /**
+   * True only when the top-level field-6 summary CONTENT actually changed as a
+   * result of this action (i.e. a fresh native summary was generated). A
+   * checkpoint can mutate (tokenDetails, turns, counters) without producing a
+   * new summary, in which case `decodeCheckpointSummary` would return the
+   * PREVIOUS compaction's text; committing that against a new firstKeptEntryId
+   * would silently drop history. This is the authoritative success signal.
+   */
+  summaryChanged: boolean;
   /**
    * The faithful, cumulative, identifier-exact summary text from the checkpoint's
    * top-level `ConversationStateStructure.summary` (field 6, populated by the
@@ -2774,12 +2783,15 @@ function checkpointUsedTokens(
 export async function summarizeSessionAndGetSummary(
   sessionId?: string,
 ): Promise<NativeCompactionResult> {
-  if (!sessionId) return { ok: false, mutated: false };
+  if (!sessionId) return { ok: false, mutated: false, summaryChanged: false };
   const convKey = deriveConversationKeyFromSessionId(sessionId);
   const before = conversationStates.get(convKey);
   const beforeHex = before?.checkpoint
     ? Buffer.from(before.checkpoint).toString("hex")
     : null;
+  // Snapshot the PRE-action field-6 summary so we can tell whether this action
+  // actually generated a new one (vs merely bumping tokenDetails/turns).
+  const summaryBefore = decodeCheckpointSummary(before);
   const tokensBefore = checkpointUsedTokens(before);
   const ok = await summarizeSession(sessionId);
   const after = conversationStates.get(convKey);
@@ -2788,20 +2800,33 @@ export async function summarizeSessionAndGetSummary(
     : null;
   const mutated = beforeHex !== afterHex;
   const tokensAfter = checkpointUsedTokens(after);
+  const summaryAfter = decodeCheckpointSummary(after);
+  // A fresh summary means field-6 content is present AND differs from before.
+  // Identical text means nothing new was compacted (committing it would drop
+  // the messages between the old summary boundary and firstKeptEntryId), so it
+  // is treated as "no fresh summary" too.
+  const summaryChanged = !!summaryAfter && summaryAfter !== summaryBefore;
   if (!ok) {
-    debugLog("summarize_extract.failed", { sessionId, mutated });
-    return { ok: false, mutated, tokensBefore, tokensAfter };
+    debugLog("summarize_extract.failed", { sessionId, mutated, summaryChanged });
+    return { ok: false, mutated, summaryChanged, tokensBefore, tokensAfter };
   }
-  const summary = decodeCheckpointSummary(after);
   debugLog("summarize_extract.done", {
     sessionId,
     mutated,
-    hasSummary: !!summary,
-    summaryLength: summary?.length ?? 0,
+    summaryChanged,
+    hasSummary: !!summaryAfter,
+    summaryLength: summaryAfter?.length ?? 0,
     tokensBefore,
     tokensAfter,
   });
-  return { ok: true, mutated, summary, tokensBefore, tokensAfter };
+  return {
+    ok: true,
+    mutated,
+    summaryChanged,
+    summary: summaryAfter,
+    tokensBefore,
+    tokensAfter,
+  };
 }
 
 export function cleanupSessionState(sessionId?: string): void {
