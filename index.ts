@@ -29,6 +29,7 @@ import {
 } from "./auth.js";
 import {
   cleanupSessionState,
+  errorLog,
   getCursorModels,
   hydrateConversationForSession,
   inferContextWindow,
@@ -185,6 +186,12 @@ function debugExtensionLog(
   event: string,
   data?: Record<string, unknown>,
 ): void {
+  // Tee error-classified events to the always-on rotating error log (shared
+  // sink in proxy.ts) so extension-side failures are captured even when the
+  // verbose debug timeline is disabled.
+  if (event.toLowerCase().includes("error")) {
+    errorLog(event, { scope: "extension", ...data });
+  }
   if (!isExtensionDebugEnabled()) return;
   const payload = JSON.stringify({
     ts: new Date().toISOString(),
@@ -545,6 +552,7 @@ export function registerSessionLifecycleCleanup(pi: ExtensionAPI): void {
       persistSessionState(sessionId, leafOf(ctx));
     } catch (err) {
       debugExtensionLog("session.persist_cleanup_error", {
+        sessionId,
         error: err instanceof Error ? err.message : String(err),
       });
     }
@@ -562,6 +570,7 @@ export function registerSessionLifecycleCleanup(pi: ExtensionAPI): void {
       invalidateSessionState(sessionId);
     } catch (err) {
       debugExtensionLog("session.invalidate_cleanup_error", {
+        sessionId,
         error: err instanceof Error ? err.message : String(err),
       });
     }
@@ -591,8 +600,9 @@ export function registerSessionLifecycleCleanup(pi: ExtensionAPI): void {
   // matching pi's current leaf, so a stale/branched sidecar is ignored. No-op
   // for brand-new sessions (no sidecar).
   pi.on("session_start", (_event, ctx) => {
+    let sessionId: string | undefined;
     try {
-      const sessionId = ctx.sessionManager.getSessionId();
+      sessionId = ctx.sessionManager.getSessionId();
       const hydrated = hydrateConversationForSession(sessionId, leafOf(ctx));
       debugExtensionLog("session.start_hydrate", {
         sessionId,
@@ -601,6 +611,7 @@ export function registerSessionLifecycleCleanup(pi: ExtensionAPI): void {
       });
     } catch (err) {
       debugExtensionLog("session.start_hydrate_error", {
+        sessionId,
         error: err instanceof Error ? err.message : String(err),
       });
     }

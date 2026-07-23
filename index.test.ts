@@ -5,6 +5,7 @@ import { request as httpRequest } from "node:http";
 import {
   existsSync,
   mkdtempSync,
+  readFileSync,
   readdirSync,
   rmSync,
   statSync,
@@ -34,6 +35,7 @@ import {
   derivePiSessionId,
   deterministicConversationId,
   buildCursorRequest,
+  errorLog,
   flushConversationState,
   hydrateConversationForSession,
   invalidateSessionState,
@@ -2991,5 +2993,76 @@ describe("durable conversation-state persistence (resume across process)", () =>
     });
     expect(__testInternals.conversationStates.has(convKey)).toBe(false);
     expect(hydrateConversationForSession(sessionId, "leaf-Z")).toBe(true);
+  });
+});
+
+describe("persistent rotating error log", () => {
+  let logDir: string;
+  let logFile: string;
+  const savedEnv: Record<string, string | undefined> = {};
+  const ENV_KEYS = [
+    "PI_CURSOR_PROVIDER_ERROR_LOG",
+    "PI_CURSOR_PROVIDER_ERROR_LOG_FILE",
+    "PI_CURSOR_PROVIDER_ERROR_LOG_MAX_BYTES",
+    "PI_CURSOR_PROVIDER_ERROR_LOG_MAX_FILES",
+  ];
+
+  beforeEach(() => {
+    for (const k of ENV_KEYS) savedEnv[k] = process.env[k];
+    logDir = mkdtempSync(join(tmpdir(), "cursor-errlog-"));
+    logFile = join(logDir, "errors.log");
+    process.env.PI_CURSOR_PROVIDER_ERROR_LOG_FILE = logFile;
+  });
+
+  afterEach(() => {
+    for (const k of ENV_KEYS) {
+      if (savedEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedEnv[k]!;
+    }
+    rmSync(logDir, { recursive: true, force: true });
+  });
+
+  test("writes one JSON line per record with level and redacted fields", () => {
+    errorLog("stream.cursor_error", {
+      sessionId: "sess-1",
+      convKey: "abc123",
+      modelId: "claude-4.5-sonnet",
+      accessToken: "super-secret",
+      message: "boom",
+    });
+    const lines = readFileSync(logFile, "utf8").trim().split("\n");
+    expect(lines).toHaveLength(1);
+    const rec = JSON.parse(lines[0]!);
+    expect(rec.level).toBe("error");
+    expect(rec.event).toBe("stream.cursor_error");
+    expect(rec.sessionId).toBe("sess-1");
+    expect(rec.convKey).toBe("abc123");
+    expect(rec.modelId).toBe("claude-4.5-sonnet");
+    expect(rec.accessToken).toBe("<redacted>");
+    expect(typeof rec.ts).toBe("string");
+    expect(typeof rec.pid).toBe("number");
+  });
+
+  test("rotates when the active file exceeds the size threshold", () => {
+    process.env.PI_CURSOR_PROVIDER_ERROR_LOG_MAX_BYTES = "300";
+    process.env.PI_CURSOR_PROVIDER_ERROR_LOG_MAX_FILES = "3";
+    // Each record is well over 100 bytes; a handful forces at least one rotation.
+    for (let i = 0; i < 12; i += 1) {
+      errorLog("http.chat.error", { requestId: `req-${i}`, message: "x".repeat(80) });
+    }
+    // Active file exists and stays under (or near) the threshold post-rotation.
+    expect(existsSync(logFile)).toBe(true);
+    expect(existsSync(`${logFile}.1`)).toBe(true);
+    // Retention cap honored: never more than MAX_FILES generations.
+    expect(existsSync(`${logFile}.3`)).toBe(false);
+    // Total retained generations <= 3.
+    const gens = readdirSync(logDir).filter((n) => n.startsWith("errors.log"));
+    expect(gens.length).toBeLessThanOrEqual(3);
+  });
+
+  test("honors the disable switch", () => {
+    process.env.PI_CURSOR_PROVIDER_ERROR_LOG = "off";
+    errorLog("http.chat.error", { message: "should not be written" });
+    expect(existsSync(logFile)).toBe(false);
   });
 });

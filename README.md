@@ -74,6 +74,10 @@ pi  →  openai-completions  →  localhost:PORT/v1/chat/completions
 | ------- | ------- | ----------- |
 | `PI_CURSOR_PROVIDER_DEBUG` | off | Set to any truthy value to enable JSONL debug logging |
 | `PI_CURSOR_PROVIDER_DEBUG_FILE` | auto in tmpdir | Override the debug log file path |
+| `PI_CURSOR_PROVIDER_ERROR_LOG` | on | Set to `off`/`false`/`0` to disable the persistent rotating error log |
+| `PI_CURSOR_PROVIDER_ERROR_LOG_FILE` | `<state-dir>/logs/errors.log` | Override the error log path |
+| `PI_CURSOR_PROVIDER_ERROR_LOG_MAX_BYTES` | `5242880` (5 MB) | Size threshold before the active error log rotates |
+| `PI_CURSOR_PROVIDER_ERROR_LOG_MAX_FILES` | `5` | Generations to retain (`errors.log` + `.1` … `.4`) |
 | `PI_CURSOR_BRIDGE_INITIAL_TIMEOUT_MS` | `120000` | Kill bridge if no HTTP/2 activity within this many ms of spawn |
 | `PI_CURSOR_BRIDGE_ACTIVITY_TIMEOUT_MS` | `300000` | Kill bridge if no HTTP/2 activity for this many ms after the first frame |
 | `PI_CURSOR_BRIDGE_PING_INTERVAL_MS` | `15000` | HTTP/2 PING interval to detect dead connections |
@@ -169,6 +173,38 @@ The upstream has no observability. This fork adds opt-in JSONL event logging (se
 
 ```bash
 npm run debug:timeline -- --latest
+```
+
+### Persistent rotating error log
+
+Unlike the opt-in verbose debug timeline (`PI_CURSOR_PROVIDER_DEBUG`, which dumps
+every event to a fresh per-process file in `tmpdir`), the provider **always**
+writes failures to a small, size-rotated error log so they're easy to find after
+the fact — without reproducing the bug with debugging enabled.
+
+- **Location** — `<state-dir>/logs/errors.log`, where `<state-dir>` honors
+  `PI_CURSOR_PROVIDER_STATE_DIR` and otherwise defaults to
+  `~/.pi/agent/state/cursor-provider`. Override the exact file with
+  `PI_CURSOR_PROVIDER_ERROR_LOG_FILE`.
+- **Format** — one JSON object per line: `{ ts, pid, level, event, ... }`.
+  Access tokens and large blobs are redacted via the same sanitizer as the debug
+  timeline.
+- **Session linkage** — records carry the raw pi `sessionId` (and the derived
+  `convKey`, which is the `<convKey>.json` sidecar filename) wherever it's known,
+  so an error maps straight to a pi session and its persisted state.
+- **Rotation** — at `PI_CURSOR_PROVIDER_ERROR_LOG_MAX_BYTES` (default 5 MB) the
+  active file is renamed `errors.log` → `errors.log.1`, older generations shift
+  up, and the oldest beyond `PI_CURSOR_PROVIDER_ERROR_LOG_MAX_FILES` (default 5)
+  is dropped.
+- **Captured events** — `http.chat.error`, `stream.cursor_error`,
+  `stream.message_processing_error`, `bridge.exit_before_response`,
+  `bridge.connection_lost`, `summarize.error`, the `persist.*_error` durability
+  failures, and the extension-side `session.*_error` lifecycle failures.
+
+Find recent Cursor errors and their sessions:
+
+```sh
+tail -n 50 ~/.pi/agent/state/cursor-provider/logs/errors.log | jq -r '"\(.ts) \(.event) session=\(.sessionId) model=\(.modelId) \(.message)"'
 ```
 
 ### Transparent retry for transient errors

@@ -31,6 +31,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
   writeSync,
 } from "node:fs";
@@ -537,6 +538,7 @@ export function hydrateConversationForSession(
   } catch (err) {
     debugLog("persist.load_error", {
       convKey,
+      sessionId,
       error: err instanceof Error ? err.message : String(err),
     });
     return false;
@@ -590,6 +592,7 @@ export function invalidateSessionState(sessionId?: string): void {
   } catch (err) {
     debugLog("persist.invalidate_error", {
       convKey,
+      sessionId,
       error: err instanceof Error ? err.message : String(err),
     });
   }
@@ -657,6 +660,9 @@ function getDebugLogFilePath(): string {
 }
 
 function debugLog(event: string, data?: Record<string, unknown>): void {
+  // Tee error-classified events to the always-on rotating error log first, so
+  // failures are captured even when the verbose debug timeline is disabled.
+  if (isErrorEvent(event)) errorLog(event, data);
   if (!isProxyDebugEnabled()) return;
   const line = JSON.stringify({
     ts: new Date().toISOString(),
@@ -676,6 +682,140 @@ function debugLog(event: string, data?: Record<string, unknown>): void {
 function nextDebugRequestId(): string {
   debugRequestCounter += 1;
   return `req-${debugRequestCounter}`;
+}
+
+// ── Persistent rotating error log ──
+//
+// Unlike the opt-in verbose debug timeline (PI_CURSOR_PROVIDER_DEBUG → tmpdir,
+// one file per process, never rotated), this is an ALWAYS-ON, size-rotated
+// error log that lives under the provider's local state dir. Its job is to make
+// Cursor provider failures — and the pi session id / conversation key they map
+// to — easy to find after the fact, without having to reproduce the error with
+// verbose debugging turned on.
+//
+//   Location : <state-dir>/logs/errors.log  (state dir honors
+//              PI_CURSOR_PROVIDER_STATE_DIR; log path override below)
+//   Format   : one JSON object per line { ts, pid, level, event, ... }
+//   Rotation : at ERROR_LOG_MAX_BYTES rename errors.log → errors.log.1,
+//              shifting older generations up and dropping the oldest; keeps
+//              ERROR_LOG_MAX_FILES generations total.
+//
+// Env overrides:
+//   PI_CURSOR_PROVIDER_ERROR_LOG           off|false|0 → disable entirely
+//   PI_CURSOR_PROVIDER_ERROR_LOG_FILE      absolute path to the active log file
+//   PI_CURSOR_PROVIDER_ERROR_LOG_MAX_BYTES rotation threshold in bytes
+//   PI_CURSOR_PROVIDER_ERROR_LOG_MAX_FILES generations to retain (>= 1)
+
+const ERROR_LOG_DEFAULT_MAX_BYTES = 5 * 1024 * 1024; // 5 MB per generation
+const ERROR_LOG_DEFAULT_MAX_FILES = 5; // errors.log + .1 … .4
+
+// Maps a conversation key back to the raw pi session id so error records
+// emitted deep in the stream path (where only convKey is in scope) can still be
+// tied to a pi session. Populated per request; convKey is a 16-hex digest, so
+// this stays tiny and is cleared on session teardown.
+const sessionIdByConvKey = new Map<string, string>();
+
+function isErrorLogEnabled(): boolean {
+  const raw = process.env.PI_CURSOR_PROVIDER_ERROR_LOG?.trim().toLowerCase();
+  return !(raw === "0" || raw === "false" || raw === "off");
+}
+
+function errorLogMaxBytes(): number {
+  const raw = Number(process.env.PI_CURSOR_PROVIDER_ERROR_LOG_MAX_BYTES);
+  return Number.isFinite(raw) && raw > 0 ? raw : ERROR_LOG_DEFAULT_MAX_BYTES;
+}
+
+function errorLogMaxFiles(): number {
+  const raw = Number(process.env.PI_CURSOR_PROVIDER_ERROR_LOG_MAX_FILES);
+  return Number.isInteger(raw) && raw >= 1 ? raw : ERROR_LOG_DEFAULT_MAX_FILES;
+}
+
+function getErrorLogFilePath(): string {
+  const configured = process.env.PI_CURSOR_PROVIDER_ERROR_LOG_FILE?.trim();
+  if (configured) return configured;
+  return pathJoin(conversationStateDir(), "logs", "errors.log");
+}
+
+/**
+ * Size-based rotation. When the active log reaches the threshold, drop the
+ * oldest generation and shift every remaining generation up by one, then rename
+ * the active file to `.1`. Best-effort throughout: a rotation failure must never
+ * prevent the current line from being written (worst case the file grows past
+ * the threshold until the next successful rotation).
+ */
+function rotateErrorLogIfNeeded(file: string): void {
+  const maxFiles = errorLogMaxFiles();
+  let size = 0;
+  try {
+    size = statSync(file).size;
+  } catch {
+    return; // file does not exist yet — nothing to rotate
+  }
+  if (size < errorLogMaxBytes()) return;
+  // Single-generation retention: just truncate by removing the active file.
+  if (maxFiles <= 1) {
+    try {
+      rmSync(file, { force: true });
+    } catch {
+      /* best-effort */
+    }
+    return;
+  }
+  try {
+    rmSync(`${file}.${maxFiles - 1}`, { force: true });
+  } catch {
+    /* best-effort */
+  }
+  for (let i = maxFiles - 2; i >= 1; i -= 1) {
+    try {
+      if (existsSync(`${file}.${i}`)) renameSync(`${file}.${i}`, `${file}.${i + 1}`);
+    } catch {
+      /* best-effort */
+    }
+  }
+  try {
+    renameSync(file, `${file}.1`);
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** True for events whose name marks them as a failure (e.g. `*.error`). */
+function isErrorEvent(event: string): boolean {
+  return event.toLowerCase().includes("error");
+}
+
+/**
+ * Append one error record to the persistent rotating log. Always-on (unless
+ * disabled via env) and independent of the verbose debug timeline. Reuses
+ * sanitizeForDebug so tokens / large blobs are redacted the same way. When a
+ * record carries a `convKey` but no `sessionId`, the pi session id is filled in
+ * from the per-request map so stream-path failures still tie back to a session.
+ * Never throws — logging must not take down a request.
+ */
+export function errorLog(event: string, data?: Record<string, unknown>): void {
+  if (!isErrorLogEnabled()) return;
+  let record = data;
+  if (record && record.sessionId == null && typeof record.convKey === "string") {
+    const sid = sessionIdByConvKey.get(record.convKey);
+    if (sid) record = { ...record, sessionId: sid };
+  }
+  const line = JSON.stringify({
+    ts: new Date().toISOString(),
+    pid: process.pid,
+    level: "error",
+    event,
+    ...(record ? sanitizeForDebug(record) : {}),
+  });
+  const file = getErrorLogFilePath();
+  try {
+    mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+    rotateErrorLogIfNeeded(file);
+    appendFileSync(file, `${line}\n`, "utf8");
+  } catch (err) {
+    console.error("[cursor-provider] failed to write error log", err);
+    console.error(`[cursor-provider] ${line}`);
+  }
 }
 
 export const __testInternals = {
@@ -1147,9 +1287,11 @@ export async function startProxy(
       }
 
       if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
+        let parsedForError: ChatCompletionRequest | undefined;
         try {
           const body = await readBody(req);
           const parsed = JSON.parse(body) as ChatCompletionRequest;
+          parsedForError = parsed;
           debugLog("http.chat.body", { requestId, body: parsed });
           if (!proxyAccessTokenProvider)
             throw new Error("No access token provider");
@@ -1157,8 +1299,16 @@ export async function startProxy(
           await handleChatCompletion(parsed, accessToken, req, res, requestId);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
+          const sessionId = parsedForError
+            ? derivePiSessionId(parsedForError)
+            : undefined;
           debugLog("http.chat.error", {
             requestId,
+            sessionId,
+            convKey: sessionId
+              ? deriveConversationKeyFromSessionId(sessionId)
+              : undefined,
+            model: parsedForError?.model,
             message,
             stack: err instanceof Error ? err.stack : undefined,
           });
@@ -1212,6 +1362,7 @@ export function cleanupAllSessionState(): void {
   }
   sessionBridges.clear();
   conversationStates.clear();
+  sessionIdByConvKey.clear();
 }
 
 export function stopProxy(): void {
@@ -1388,6 +1539,9 @@ async function handleChatCompletion(
   const sessionId = derivePiSessionId(body);
   const bridgeKey = deriveBridgeKey(body.messages, sessionId);
   const convKey = deriveConversationKey(body.messages, sessionId);
+  // Remember the convKey → sessionId link so stream-path error records (which
+  // only have convKey in scope) can still be tied back to a pi session.
+  if (sessionId) sessionIdByConvKey.set(convKey, sessionId);
   const activeBridge = activeBridges.get(bridgeKey);
   debugLog("chat.session_keys", {
     requestId,
@@ -2656,6 +2810,8 @@ export async function summarizeSession(sessionId?: string): Promise<boolean> {
   } catch (err) {
     debugLog("summarize.error", {
       sessionId,
+      convKey,
+      modelId,
       error: err instanceof Error ? err.message : String(err),
     });
     return false;
@@ -2801,6 +2957,7 @@ export function cleanupSessionState(sessionId?: string): void {
   // fork, invalidateSessionState on tree) so that a same-sessionId tree
   // navigation never re-adopts the abandoned branch's checkpoint.
   conversationStates.delete(convKey);
+  sessionIdByConvKey.delete(convKey);
 }
 
 export function deterministicConversationId(convKey: string): string {
@@ -3457,6 +3614,13 @@ function writeSSEStream(
             "[cursor-provider] Stream message processing error:",
             err instanceof Error ? err.message : err,
           );
+          debugLog("stream.message_processing_error", {
+            requestId,
+            convKey,
+            modelId,
+            message: err instanceof Error ? err.message : String(err),
+            stack: err instanceof Error ? err.stack : undefined,
+          });
         }
       },
       (endStreamBytes) => {
@@ -3481,6 +3645,14 @@ function writeSSEStream(
             `[cursor-provider] Cursor stream error (${modelId}):`,
             endError.message,
           );
+          debugLog("stream.cursor_error", {
+            requestId,
+            bridgeKey,
+            convKey,
+            modelId,
+            message: endError.message,
+            retryable: endError.retryable,
+          });
           activeBridge.end();
           activeBridge.unref();
           sendSSE(makeChunk({ content: endError.message }, "error"));
@@ -3608,6 +3780,14 @@ function writeSSEStream(
             `[cursor-provider] Bridge exited (code ${code}) before receiving response (${modelId})`,
           );
           const failureMsg = classifyBridgeFailure(code, activeBridge.getStderr());
+          debugLog("bridge.exit_before_response", {
+            requestId,
+            bridgeKey,
+            convKey,
+            modelId,
+            code,
+            message: failureMsg,
+          });
           sendSSE(makeChunk({ content: failureMsg }, "error"));
           sendSSE(makeUsageChunk());
           sendDone();
@@ -3626,6 +3806,13 @@ function writeSSEStream(
           closeResponse();
         }
       } else if (code !== 0) {
+        debugLog("bridge.connection_lost", {
+          requestId,
+          bridgeKey,
+          convKey,
+          modelId,
+          code,
+        });
         sendSSE(makeChunk({ content: "Bridge connection lost" }, "error"));
         sendSSE(makeUsageChunk());
         sendDone();
